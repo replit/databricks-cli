@@ -27,6 +27,7 @@ func (*ResourceExperiment) PrepareState(input *resources.MlflowExperiment) *ml.C
 		Name:             input.Name,
 		ArtifactLocation: input.ArtifactLocation,
 		Tags:             input.Tags,
+		TraceLocation:    input.TraceLocation,
 		ForceSendFields:  utils.FilterFields[ml.CreateExperiment](input.ForceSendFields),
 	}
 }
@@ -36,6 +37,7 @@ func (*ResourceExperiment) RemapState(experiment *ml.Experiment) *ml.CreateExper
 		Name:             experiment.Name,
 		ArtifactLocation: experiment.ArtifactLocation,
 		Tags:             experiment.Tags,
+		TraceLocation:    experiment.TraceLocation,
 		ForceSendFields:  utils.FilterFields[ml.CreateExperiment](experiment.ForceSendFields),
 	}
 }
@@ -68,7 +70,7 @@ func (r *ResourceExperiment) DoUpdate(ctx context.Context, id string, config *ml
 	return nil, r.client.Experiments.UpdateExperiment(ctx, updateReq)
 }
 
-func (r *ResourceExperiment) DoDelete(ctx context.Context, id string) error {
+func (r *ResourceExperiment) DoDelete(ctx context.Context, id string, _ *ml.CreateExperiment) error {
 	return r.client.Experiments.DeleteExperiment(ctx, ml.DeleteExperiment{
 		ExperimentId: id,
 	})

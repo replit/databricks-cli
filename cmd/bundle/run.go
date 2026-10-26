@@ -10,6 +10,7 @@ import (
 	"slices"
 
 	"github.com/databricks/cli/bundle"
+	"github.com/databricks/cli/bundle/config"
 	"github.com/databricks/cli/bundle/env"
 	"github.com/databricks/cli/bundle/resources"
 	"github.com/databricks/cli/bundle/run"
@@ -20,6 +21,7 @@ import (
 	"github.com/databricks/cli/libs/auth"
 	"github.com/databricks/cli/libs/cmdctx"
 	"github.com/databricks/cli/libs/cmdio"
+	"github.com/databricks/cli/libs/dyn"
 	"github.com/databricks/cli/libs/execv"
 	"github.com/databricks/cli/libs/flags"
 	"github.com/databricks/cli/libs/logdiag"
@@ -136,6 +138,9 @@ Example usage:
 		if cmd.ArgsLenAtDash() == 0 && len(args) > 0 {
 			b, err := utils.ProcessBundle(cmd, utils.ProcessOptions{
 				SkipInitialize: true,
+				InitFunc: func(b *bundle.Bundle) {
+					b.AllowTerraformEngineConfig = true
+				},
 			})
 			if err != nil {
 				return err
@@ -152,6 +157,10 @@ Example usage:
 		_, _, err := utils.ProcessBundleRet(cmd, utils.ProcessOptions{
 			AlwaysPull:        true,
 			ErrorOnEmptyState: true,
+			// Let users run a bundle that pins the removed Terraform engine.
+			InitFunc: func(b *bundle.Bundle) {
+				b.AllowTerraformEngineConfig = true
+			},
 			PostInitFunc: func(ctx context.Context, b *bundle.Bundle) error {
 				var err error
 				key, runArgs, err = resolveRunArgument(ctx, b, args)
@@ -165,12 +174,28 @@ Example usage:
 					if len(runArgs) > 0 {
 						return fmt.Errorf("additional arguments are not supported for scripts. Got: %v. We recommend using environment variables to pass runtime arguments to a script. For example: FOO=bar databricks bundle run my_script", runArgs)
 					}
-					return executeScript(b.Config.Scripts[key].Content, cmd, b)
+					return executeScript(b.Config.Scripts[key], cmd, b)
 				}
 
 				return nil
 			},
 			PostStateFunc: func(ctx context.Context, b *bundle.Bundle, stateDesc *statemgmt.StateDesc) error {
+				ref, err := resources.Lookup(b, key, run.IsRunnable)
+				if err != nil {
+					return err
+				}
+
+				// Resolve ${resources.*} references within the resource being run so its
+				// runner sees concrete values (e.g. an app's env vars referencing another
+				// resource, or its source_code_path pointing at the immutable snapshot's
+				// full_path, which lives only in the deployed state).
+				target := dyn.NewPath(dyn.Key("resources"), dyn.Key(ref.Description.PluralName), dyn.Key(ref.Key))
+				if err := b.DeploymentBundle.ResolveConfigAgainstState(&b.Config, target); err != nil {
+					return err
+				}
+
+				// Re-resolve after ResolveConfigAgainstState so the runner reads the resolved
+				// resource; the ref above is a pre-resolution snapshot.
 				runner, err := keyToRunner(b, key)
 				if err != nil {
 					return err
@@ -276,8 +301,14 @@ func scriptEnv(cmd *cobra.Command, b *bundle.Bundle) []string {
 	return out
 }
 
-func executeScript(content string, cmd *cobra.Command, b *bundle.Bundle) error {
-	return execv.Shell(content, b.BundleRootPath, scriptEnv(cmd, b))
+func executeScript(script config.Script, cmd *cobra.Command, b *bundle.Bundle) error {
+	env := scriptEnv(cmd, b)
+	// Append after the auth/target variables so a script's env: section takes
+	// precedence on collision (os/exec uses the last value for a duplicate key).
+	for _, name := range slices.Sorted(maps.Keys(script.Env)) {
+		env = append(env, name+"="+script.Env[name])
+	}
+	return execv.Shell(script.Content, b.BundleRootPath, env)
 }
 
 func executeInline(cmd *cobra.Command, args []string, b *bundle.Bundle) error {

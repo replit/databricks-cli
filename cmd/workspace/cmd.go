@@ -5,12 +5,17 @@ package workspace
 import (
 	access_control "github.com/databricks/cli/cmd/workspace/access-control"
 	agent_bricks "github.com/databricks/cli/cmd/workspace/agent-bricks"
+	agent_kit "github.com/databricks/cli/cmd/workspace/agent-kit"
+	ai_functions "github.com/databricks/cli/cmd/workspace/ai-functions"
+	ai_gateway "github.com/databricks/cli/cmd/workspace/ai-gateway"
+	ai_search "github.com/databricks/cli/cmd/workspace/ai-search"
 	alerts "github.com/databricks/cli/cmd/workspace/alerts"
 	alerts_legacy "github.com/databricks/cli/cmd/workspace/alerts-legacy"
 	alerts_v2 "github.com/databricks/cli/cmd/workspace/alerts-v2"
 	apps "github.com/databricks/cli/cmd/workspace/apps"
 	apps_settings "github.com/databricks/cli/cmd/workspace/apps-settings"
 	artifact_allowlists "github.com/databricks/cli/cmd/workspace/artifact-allowlists"
+	bundle_deployments "github.com/databricks/cli/cmd/workspace/bundle-deployments"
 	catalogs "github.com/databricks/cli/cmd/workspace/catalogs"
 	clean_room_asset_revisions "github.com/databricks/cli/cmd/workspace/clean-room-asset-revisions"
 	clean_room_assets "github.com/databricks/cli/cmd/workspace/clean-room-assets"
@@ -34,6 +39,7 @@ import (
 	data_quality "github.com/databricks/cli/cmd/workspace/data-quality"
 	data_sources "github.com/databricks/cli/cmd/workspace/data-sources"
 	database "github.com/databricks/cli/cmd/workspace/database"
+	domains "github.com/databricks/cli/cmd/workspace/domains"
 	entity_tag_assignments "github.com/databricks/cli/cmd/workspace/entity-tag-assignments"
 	environments "github.com/databricks/cli/cmd/workspace/environments"
 	experiments "github.com/databricks/cli/cmd/workspace/experiments"
@@ -94,20 +100,24 @@ import (
 	repos "github.com/databricks/cli/cmd/workspace/repos"
 	resource_quotas "github.com/databricks/cli/cmd/workspace/resource-quotas"
 	rfa "github.com/databricks/cli/cmd/workspace/rfa"
+	sandbox "github.com/databricks/cli/cmd/workspace/sandbox"
 	schemas "github.com/databricks/cli/cmd/workspace/schemas"
 	secrets "github.com/databricks/cli/cmd/workspace/secrets"
+	secrets_uc "github.com/databricks/cli/cmd/workspace/secrets-uc"
 	service_principal_secrets_proxy "github.com/databricks/cli/cmd/workspace/service-principal-secrets-proxy"
 	service_principals_v2 "github.com/databricks/cli/cmd/workspace/service-principals-v2"
 	serving_endpoints "github.com/databricks/cli/cmd/workspace/serving-endpoints"
 	settings "github.com/databricks/cli/cmd/workspace/settings"
 	shares "github.com/databricks/cli/cmd/workspace/shares"
 	storage_credentials "github.com/databricks/cli/cmd/workspace/storage-credentials"
+	supervisor_agents "github.com/databricks/cli/cmd/workspace/supervisor-agents"
 	system_schemas "github.com/databricks/cli/cmd/workspace/system-schemas"
 	table_constraints "github.com/databricks/cli/cmd/workspace/table-constraints"
 	tables "github.com/databricks/cli/cmd/workspace/tables"
 	tag_policies "github.com/databricks/cli/cmd/workspace/tag-policies"
 	temporary_path_credentials "github.com/databricks/cli/cmd/workspace/temporary-path-credentials"
 	temporary_table_credentials "github.com/databricks/cli/cmd/workspace/temporary-table-credentials"
+	temporary_volume_credentials "github.com/databricks/cli/cmd/workspace/temporary-volume-credentials"
 	token_management "github.com/databricks/cli/cmd/workspace/token-management"
 	tokens "github.com/databricks/cli/cmd/workspace/tokens"
 	users_v2 "github.com/databricks/cli/cmd/workspace/users-v2"
@@ -133,12 +143,17 @@ func All() []*cobra.Command {
 
 	out = append(out, access_control.New())
 	out = append(out, agent_bricks.New())
+	out = append(out, agent_kit.New())
+	out = append(out, ai_functions.New())
+	out = append(out, ai_gateway.New())
+	out = append(out, ai_search.New())
 	out = append(out, alerts.New())
 	out = append(out, alerts_legacy.New())
 	out = append(out, alerts_v2.New())
 	out = append(out, apps.New())
 	out = append(out, apps_settings.New())
 	out = append(out, artifact_allowlists.New())
+	out = append(out, bundle_deployments.New())
 	out = append(out, catalogs.New())
 	out = append(out, clean_room_asset_revisions.New())
 	out = append(out, clean_room_assets.New())
@@ -162,6 +177,7 @@ func All() []*cobra.Command {
 	out = append(out, data_quality.New())
 	out = append(out, data_sources.New())
 	out = append(out, database.New())
+	out = append(out, domains.New())
 	out = append(out, entity_tag_assignments.New())
 	out = append(out, environments.New())
 	out = append(out, experiments.New())
@@ -222,20 +238,24 @@ func All() []*cobra.Command {
 	out = append(out, repos.New())
 	out = append(out, resource_quotas.New())
 	out = append(out, rfa.New())
+	out = append(out, sandbox.New())
 	out = append(out, schemas.New())
 	out = append(out, secrets.New())
+	out = append(out, secrets_uc.New())
 	out = append(out, service_principal_secrets_proxy.New())
 	out = append(out, service_principals_v2.New())
 	out = append(out, serving_endpoints.New())
 	out = append(out, settings.New())
 	out = append(out, shares.New())
 	out = append(out, storage_credentials.New())
+	out = append(out, supervisor_agents.New())
 	out = append(out, system_schemas.New())
 	out = append(out, table_constraints.New())
 	out = append(out, tables.New())
 	out = append(out, tag_policies.New())
 	out = append(out, temporary_path_credentials.New())
 	out = append(out, temporary_table_credentials.New())
+	out = append(out, temporary_volume_credentials.New())
 	out = append(out, token_management.New())
 	out = append(out, tokens.New())
 	out = append(out, users_v2.New())

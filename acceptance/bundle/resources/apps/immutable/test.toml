@@ -1,0 +1,17 @@
+Cloud = false # Temporary disable cloud tests until the API is fully available
+RecordRequests = true
+
+# immutable_folder only works with the direct engine.
+
+Ignore = [
+    "databricks.yml",
+    ".databricks",
+    ".venv",
+    "*.pyc",
+]
+
+# Normalize the content-addressed snapshot hash so the test doesn't need
+# to be updated whenever the bundle content changes.
+[[Repls]]
+Old = '[0-9a-f]{64}'
+New = '[SNAPSHOT_HASH]'

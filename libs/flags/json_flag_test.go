@@ -7,10 +7,24 @@ import (
 
 	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/cli/libs/dyn"
+	"github.com/databricks/cli/libs/structs/structpath"
 	"github.com/databricks/databricks-sdk-go/service/jobs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestJsonFlagValidate(t *testing.T) {
+	var unset JsonFlag
+	assert.NoError(t, unset.Validate())
+
+	var valid JsonFlag
+	require.NoError(t, valid.Set(`{"job_id": 18000000000000000123}`))
+	assert.NoError(t, valid.Validate())
+
+	var invalid JsonFlag
+	require.NoError(t, invalid.Set(`{"a": 1,}`))
+	assert.EqualError(t, invalid.Validate(), "error decoding JSON at (inline):1:8: invalid character ',' looking for beginning of value")
+}
 
 func TestJsonFlagEmpty(t *testing.T) {
 	var body JsonFlag
@@ -22,6 +36,13 @@ func TestJsonFlagEmpty(t *testing.T) {
 	assert.NoError(t, diags.Error())
 	assert.Empty(t, diags)
 	assert.Nil(t, request)
+}
+
+func TestJsonFlagEmptyValue(t *testing.T) {
+	var body JsonFlag
+
+	err := body.Set("")
+	assert.EqualError(t, err, "expected inline JSON or @path/to/file, got an empty string")
 }
 
 func TestJsonFlagInline(t *testing.T) {
@@ -174,14 +195,14 @@ func TestJsonUnmarshalRequestMismatch(t *testing.T) {
 	assert.Contains(t, diags, diag.Diagnostic{
 		Severity: diag.Warning,
 		Summary:  "unknown field: settings",
-		Locations: []dyn.Location{
+		Locations: []diag.Location{
 			{
 				File:   "(inline)",
 				Line:   3,
 				Column: 6,
 			},
 		},
-		Paths: []dyn.Path{{}},
+		Paths: dyn.ToStructPaths(dyn.EmptyPath),
 	})
 }
 
@@ -232,14 +253,14 @@ func TestJsonUnmarshalWrongTypeReportsCorrectLocation(t *testing.T) {
 	assert.Contains(t, diags, diag.Diagnostic{
 		Severity: diag.Warning,
 		Summary:  "expected int, found sequence",
-		Locations: []dyn.Location{
+		Locations: []diag.Location{
 			{
 				File:   "(inline)",
 				Line:   2,
 				Column: 15,
 			},
 		},
-		Paths: []dyn.Path{dyn.NewPath(dyn.Key("job_id"))},
+		Paths: structpath.NewPathSlice("job_id"),
 	})
 }
 
@@ -257,14 +278,14 @@ func TestJsonUnmarshalArrayInsteadOfIntReportsCorrectLocation(t *testing.T) {
 	assert.Contains(t, diags, diag.Diagnostic{
 		Severity: diag.Warning,
 		Summary:  "cannot parse \"wrong_type\" as an integer",
-		Locations: []dyn.Location{
+		Locations: []diag.Location{
 			{
 				File:   "(inline)",
 				Line:   14,
 				Column: 40,
 			},
 		},
-		Paths: []dyn.Path{dyn.NewPath(dyn.Key("new_settings"), dyn.Key("timeout_seconds"))},
+		Paths: structpath.NewPathSlice("new_settings", "timeout_seconds"),
 	})
 }
 
@@ -283,4 +304,45 @@ func TestJsonUnmarshalForRequestWithForceSendFields(t *testing.T) {
 	assert.False(t, r.NewSettings.NotificationSettings.NoAlertForCanceledRuns)
 	assert.NotContains(t, r.NewSettings.NotificationSettings.ForceSendFields, "NoAlertForSkippedRuns")
 	assert.Contains(t, r.NewSettings.NotificationSettings.ForceSendFields, "NoAlertForCanceledRuns")
+}
+
+func TestRejectWrappedJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		outerKey string
+		wantErr  string
+	}{
+		{name: "empty body passes", raw: "", outerKey: "role"},
+		{name: "non-object body passes", raw: `"not-an-object"`, outerKey: "role"},
+		{name: "object without outer key passes", raw: `{"spec":{"foo":"bar"}}`, outerKey: "role"},
+		{name: "object with outer key rejected", raw: `{"role":{"spec":{"foo":"bar"}}}`, outerKey: "role", wantErr: `should NOT be wrapped`},
+		{name: "object with outer key plus siblings still rejected", raw: `{"role":{},"other":1}`, outerKey: "role", wantErr: `should NOT be wrapped`},
+		{name: "outer key differs from body's outer", raw: `{"branch":{}}`, outerKey: "role"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var jf JsonFlag
+			if tt.raw != "" {
+				require.NoError(t, jf.Set(tt.raw))
+			}
+			err := jf.RejectWrappedJSON(tt.outerKey, "")
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestRejectWrappedJSONIncludesExample(t *testing.T) {
+	var jf JsonFlag
+	require.NoError(t, jf.Set(`{"role":{}}`))
+	err := jf.RejectWrappedJSON("role", "databricks postgres create-role --json '{\"spec\":{}}'")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Example:")
+	assert.Contains(t, err.Error(), `--json '{"spec":{}}'`)
 }

@@ -74,7 +74,8 @@ Use after deployment to quickly navigate to your resources in the workspace.`,
 				arg, err = resolveOpenArgument(ctx, b, args)
 				return err
 			},
-			InitIDs: true,
+			AlwaysPull: forcePull,
+			InitIDs:    true,
 		})
 		if err != nil {
 			return err
@@ -87,7 +88,10 @@ Use after deployment to quickly navigate to your resources in the workspace.`,
 		}
 
 		// Confirm that the resource has a URL.
-		url := ref.Resource.GetURL()
+		url, supported := ref.Resource.GetURL()
+		if !supported {
+			return errors.New("this resource type does not have a URL")
+		}
 		if url == "" {
 			return errors.New("resource does not have a URL associated with it (has it been deployed?)")
 		}

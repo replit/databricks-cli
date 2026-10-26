@@ -52,6 +52,7 @@ func applyInitializeMutators(ctx context.Context, b *bundle.Bundle) {
 	}{
 		{"resources.dashboards.*.parent_path", b.Config.Workspace.ResourcePath},
 		{"resources.dashboards.*.embed_credentials", false},
+		{"resources.genie_spaces.*.parent_path", b.Config.Workspace.ResourcePath},
 		{"resources.volumes.*.volume_type", "MANAGED"},
 
 		{"resources.alerts.*.parent_path", b.Config.Workspace.ResourcePath},
@@ -71,10 +72,6 @@ func applyInitializeMutators(ctx context.Context, b *bundle.Bundle) {
 		{"resources.jobs.*.queue", map[string]dyn.Value{
 			"enabled": dyn.V(true),
 		}},
-
-		// This is converted from single-task to multi-task
-		{"resources.jobs.*.task[*].dbt_task.schema", "default"},
-		{"resources.jobs.*.task[*].for_each_task.task.dbt_task.schema", "default"},
 
 		// https://github.com/databricks/terraform-provider-databricks/blob/v1.75.0/clusters/resource_cluster.go
 		{"resources.jobs.*.job_clusters[*].new_cluster.workload_type.clients.notebooks", true},
@@ -114,6 +111,11 @@ func applyInitializeMutators(ctx context.Context, b *bundle.Bundle) {
 		// Updates (typed): b.Config.Resources.Dashboards[].ParentPath (ensures /Workspace prefix is present)
 		// Ensures dashboard parent paths have the required /Workspace prefix
 		DashboardFixups(),
+
+		// Reads (typed): b.Config.Resources.GenieSpaces (checks genie space configurations)
+		// Updates (typed): b.Config.Resources.GenieSpaces[].ParentPath (ensures /Workspace prefix is present)
+		// Ensures genie space parent paths have the required /Workspace prefix
+		GenieSpaceFixups(),
 
 		// Reads (typed): b.Config.Permissions (validates permission levels)
 		// Reads (dynamic): resources.{jobs,pipelines,experiments,models,model_serving_endpoints,dashboards,apps,vector_search_endpoints,...}.*.permissions (reads existing permissions)
@@ -167,7 +169,7 @@ func applyNormalizeMutators(ctx context.Context, b *bundle.Bundle) {
 		// Updates (dynamic): resources.apps.*.resources (merges app resources with the same name)
 		MergeApps(),
 
-		// Reads (dynamic): resources.{catalogs,schemas,external_locations,volumes,registered_models}.*.grants
+		// Reads (dynamic): resources.{catalogs,schemas,external_locations,volumes,registered_models,vector_search_indexes}.*.grants
 		// Updates (dynamic): same paths — merges grant entries by principal and deduplicates privileges
 		MergeGrants(),
 
@@ -181,6 +183,14 @@ func applyNormalizeMutators(ctx context.Context, b *bundle.Bundle) {
 		// Updates (dynamic): resources.dashboards.*.serialized_dashboard
 		// Drops (dynamic): resources.dashboards.*.file_path
 		ConfigureDashboardSerializedDashboard(),
+
+		// Reads (dynamic): resources.genie_spaces.*.file_path
+		// Updates (dynamic): resources.genie_spaces.*.serialized_space
+		ConfigureGenieSpaceSerializedSpace(),
+
+		// Reads (dynamic): resources.cluster_policies.*.definition
+		// Updates (dynamic): resources.cluster_policies.*.definition (inline YAML -> JSON string)
+		ConfigureClusterPolicyDefinition(),
 
 		// Reads (typed): resources.alerts.*.file_path
 		// Updates (typed): resources.alerts.* (loads alert configuration from .dbalert.json file)
@@ -218,7 +228,7 @@ func NormalizeAndInitializeResources(
 		return selectResources(root, addedResources)
 	})
 	if err != nil {
-		logdiag.LogError(ctx, fmt.Errorf("failed to select resources: %s", err))
+		logdiag.LogError(ctx, fmt.Errorf("failed to select resources: %w", err))
 		return
 	}
 
@@ -237,7 +247,7 @@ func NormalizeAndInitializeResources(
 		return mergeResources(root, snapshot)
 	})
 	if err != nil {
-		logdiag.LogError(ctx, fmt.Errorf("failed to merge resources: %s", err))
+		logdiag.LogError(ctx, fmt.Errorf("failed to merge resources: %w", err))
 	}
 }
 
@@ -260,11 +270,22 @@ func NormalizeResources(
 		return selectResources(root, updatedResources)
 	})
 	if err != nil {
-		logdiag.LogError(ctx, fmt.Errorf("failed to select resources: %s", err))
+		logdiag.LogError(ctx, fmt.Errorf("failed to select resources: %w", err))
 		return
 	}
 
 	applyNormalizeMutators(ctx, b)
+	if logdiag.HasError(ctx) {
+		return
+	}
+
+	// Permissions added to an existing resource by a Python mutator must still get the
+	// deploying user as IS_OWNER, otherwise the Permissions API rejects the PUT with
+	// "must have exactly one owner" (#5682). FixPermissions is idempotent, so re-running
+	// it on resources that already have an owner is a no-op. ApplyBundlePermissions is
+	// intentionally not re-run here: it is not idempotent (it appends bundle-level
+	// permissions) and already ran for these resources in ProcessStaticResources.
+	bundle.ApplyContext(ctx, b, FixPermissions())
 	if logdiag.HasError(ctx) {
 		return
 	}
@@ -274,7 +295,7 @@ func NormalizeResources(
 		return mergeResources(root, snapshot)
 	})
 	if err != nil {
-		logdiag.LogError(ctx, fmt.Errorf("failed to merge resources: %s", err))
+		logdiag.LogError(ctx, fmt.Errorf("failed to merge resources: %w", err))
 	}
 }
 

@@ -3,12 +3,11 @@
 Summarize requests logs. For each log write OK if User-Agent has the right engine/ tag and MISS if not.
 """
 
-import os
-import sys
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
-
 
 TESTROOT = Path(os.environ["TESTROOT"])
 
@@ -22,12 +21,11 @@ def extract_engine(s):
 
 
 def check_user_agent(fname):
-    if ".terraform." in fname:
-        expected = "engine/terraform"
-    elif ".direct" in fname:
-        expected = "engine/direct"
-    else:
+    # The CI matrix no longer varies the engine, so the recorded-request files are no longer
+    # engine-suffixed; every deploy runs on the direct engine now.
+    if "out.requests." not in fname:
         return
+    expected = "engine/direct"
 
     printer = TESTROOT / "bin" / "print_requests.py"
 

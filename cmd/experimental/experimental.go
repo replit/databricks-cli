@@ -13,15 +13,17 @@ func New() *cobra.Command {
 		Hidden: true,
 		Long: `Experimental commands that may change in future versions.
 
-╔════════════════════════════════════════════════════════════════╗
-║  ⚠️  EXPERIMENTAL: These commands may change in future versions ║
-╚════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║  🚧  EXPERIMENTAL: These commands may change in future versions  ║
+╚══════════════════════════════════════════════════════════════════╝
 
 These commands provide early access to new features that are still under
 development. They may change or be removed in future versions without notice.`,
 	}
 
+	cmd.AddCommand(newAirCmd())
 	cmd.AddCommand(aitoolscmd.NewAitoolsCmd())
+	cmd.AddCommand(newGenieCmd())
 	cmd.AddCommand(postgrescmd.New())
 	cmd.AddCommand(newWorkspaceOpenCommand())
 

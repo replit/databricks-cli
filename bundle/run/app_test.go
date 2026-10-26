@@ -15,7 +15,7 @@ import (
 	"github.com/databricks/cli/bundle/config/resources"
 	"github.com/databricks/cli/bundle/internal/bundletest"
 	"github.com/databricks/cli/libs/cmdio"
-	"github.com/databricks/cli/libs/dyn"
+	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/cli/libs/vfs"
 	"github.com/databricks/databricks-sdk-go/experimental/mocks"
 	"github.com/databricks/databricks-sdk-go/service/apps"
@@ -57,9 +57,9 @@ func setupBundle(t *testing.T) (context.Context, *bundle.Bundle, *mocks.MockWork
 				Apps: map[string]*resources.App{
 					"my_app": {
 						App: apps.App{
-							Name: "my_app",
+							Name:           "my_app",
+							SourceCodePath: "./my_app",
 						},
-						SourceCodePath: "./my_app",
 					},
 				},
 			},
@@ -68,7 +68,7 @@ func setupBundle(t *testing.T) (context.Context, *bundle.Bundle, *mocks.MockWork
 
 	mwc := mocks.NewMockWorkspaceClient(t)
 	b.SetWorkpaceClient(mwc.WorkspaceClient)
-	bundletest.SetLocation(b, "resources.apps.my_app", []dyn.Location{{File: filepath.Join(root, "./databricks.yml")}})
+	bundletest.SetLocation(b, "resources.apps.my_app", []diag.Location{{File: filepath.Join(root, "./databricks.yml")}})
 
 	ctx := cmdio.MockDiscard(t.Context())
 
@@ -308,11 +308,11 @@ func TestBuildAppDeploymentWithValueFrom(t *testing.T) {
 	// Regular env var with value
 	require.Equal(t, "REGULAR_VAR", deployment.EnvVars[0].Name)
 	require.Equal(t, "regular_value", deployment.EnvVars[0].Value)
-	require.Equal(t, "", deployment.EnvVars[0].ValueFrom)
+	require.Empty(t, deployment.EnvVars[0].ValueFrom)
 
 	// Env var with value_from
 	require.Equal(t, "SECRET_VAR", deployment.EnvVars[1].Name)
-	require.Equal(t, "", deployment.EnvVars[1].Value)
+	require.Empty(t, deployment.EnvVars[1].Value)
 	require.Equal(t, "secrets/my-secret", deployment.EnvVars[1].ValueFrom)
 
 	// Env var with both value and value_from

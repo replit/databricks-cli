@@ -1,0 +1,5 @@
+# Genie spaces are only deployed via the direct deployment engine.
+
+[[Repls]]
+Old = "[0-9a-f]{32}"
+New = "[GENIE_SPACE_ID]"

@@ -3,16 +3,8 @@
 package bundle
 
 import (
-	"context"
-	"errors"
-
-	"github.com/databricks/cli/bundle"
-	"github.com/databricks/cli/bundle/phases"
-	"github.com/databricks/cli/bundle/statemgmt"
 	"github.com/databricks/cli/cmd/bundle/utils"
 	"github.com/databricks/cli/cmd/root"
-	"github.com/databricks/cli/libs/cmdio"
-	"github.com/databricks/cli/libs/logdiag"
 	"github.com/spf13/cobra"
 )
 
@@ -37,45 +29,14 @@ Typical use cases:
 
 	var autoApprove bool
 	var forceDestroy bool
+	var quiet int
 	cmd.Flags().BoolVar(&autoApprove, "auto-approve", false, "Skip interactive approvals for deleting resources and files")
 	cmd.Flags().BoolVar(&forceDestroy, "force-lock", false, "Force acquisition of deployment lock.")
+	cmd.Flags().CountVarP(&quiet, "quiet", "q", "Reduce output: -qq prints only warnings and errors.")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		return CommandBundleDestroy(cmd, args, autoApprove, forceDestroy)
+		return utils.CommandBundleDestroy(cmd, args, autoApprove, forceDestroy)
 	}
 
 	return cmd
-}
-
-func CommandBundleDestroy(cmd *cobra.Command, args []string, autoApprove, forceDestroy bool) error {
-	// We require auto-approve for non-interactive terminals since prompts are not possible.
-	if !cmdio.IsPromptSupported(cmd.Context()) && !autoApprove {
-		return errors.New("please specify --auto-approve since terminal does not support interactive prompts")
-	}
-
-	// Check if context is already initialized (e.g., when called from apps delete override)
-	skipInitContext := logdiag.IsSetup(cmd.Context())
-
-	opts := utils.ProcessOptions{
-		InitFunc: func(b *bundle.Bundle) {
-			// If `--force-lock` is specified, force acquisition of the deployment lock.
-			b.Config.Bundle.Deployment.Lock.Force = forceDestroy
-
-			// If `--auto-approve`` is specified, we skip confirmation checks
-			b.AutoApprove = autoApprove
-		},
-		// Skip context initialization if already initialized by parent command
-		SkipInitContext: skipInitContext,
-		AlwaysPull:      true,
-		PostStateFunc: func(ctx context.Context, b *bundle.Bundle, stateDesc *statemgmt.StateDesc) error {
-			phases.Destroy(ctx, b, stateDesc.Engine)
-			if logdiag.HasError(ctx) {
-				return root.ErrAlreadyPrinted
-			}
-			return nil
-		},
-	}
-
-	_, _, err := utils.ProcessBundleRet(cmd, opts)
-	return err
 }

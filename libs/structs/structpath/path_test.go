@@ -308,7 +308,7 @@ func TestPathAndPatternNode(t *testing.T) {
 
 				gotStringKey, isStringKey := tt.pathNode.StringKey()
 				if tt.StringKey == nil {
-					assert.Equal(t, "", gotStringKey)
+					assert.Empty(t, gotStringKey)
 					assert.False(t, isStringKey)
 				} else {
 					expected := tt.StringKey.(string)
@@ -319,8 +319,8 @@ func TestPathAndPatternNode(t *testing.T) {
 				// KeyValue
 				gotKey, gotValue, isKeyValue := tt.pathNode.KeyValue()
 				if tt.KeyValue == nil {
-					assert.Equal(t, "", gotKey)
-					assert.Equal(t, "", gotValue)
+					assert.Empty(t, gotKey)
+					assert.Empty(t, gotValue)
 					assert.False(t, isKeyValue)
 				} else {
 					assert.Equal(t, tt.KeyValue[0], gotKey)
@@ -988,6 +988,56 @@ func TestHasPatternPrefix(t *testing.T) {
 			pattern:  "a.x.c",
 			expected: false,
 		},
+
+		// Bracket map key globs
+		{
+			name:     "bracket map key glob matches managed delta property",
+			path:     "properties['unity.catalog.managed.delta.defaults.delta.enableRowTracking']",
+			pattern:  "properties['unity.catalog.managed.*.defaults.*']",
+			expected: true,
+		},
+		{
+			name:     "bracket map key glob matches managed iceberg property",
+			path:     "properties['unity.catalog.managed.iceberg.defaults.delta.feature.catalogManaged']",
+			pattern:  "properties['unity.catalog.managed.*.defaults.*']",
+			expected: true,
+		},
+		{
+			name:     "bracket map key glob rejects unrelated property",
+			path:     "properties['custom.remote_only']",
+			pattern:  "properties['unity.catalog.managed.*.defaults.*']",
+			expected: false,
+		},
+		{
+			name:     "bracket map key glob rejects mismatched non-wildcard segment",
+			path:     "properties['unity.catalog.managed.delta.other.delta.enableRowTracking']",
+			pattern:  "properties['unity.catalog.managed.*.defaults.*']",
+			expected: false,
+		},
+		{
+			// A trailing '*' matches the segment(s) after the preceding literal
+			// '.'; a key ending in '.' has an empty final segment, which matches.
+			name:     "bracket map key glob trailing star matches empty child",
+			path:     "properties['unity.catalog.managed.something.defaults.']",
+			pattern:  "properties['unity.catalog.managed.something.defaults.*']",
+			expected: true,
+		},
+		{
+			// A trailing '*' requires a child segment; a key ending at the
+			// preceding literal (no trailing '.') has nothing for '*' to match.
+			name:     "bracket map key glob trailing star requires a child segment",
+			path:     "properties['unity.catalog.managed.delta.defaults']",
+			pattern:  "properties['unity.catalog.managed.delta.defaults.*']",
+			expected: false,
+		},
+		{
+			// A non-trailing '*' consumes exactly one segment, so a key missing
+			// that segment does not match.
+			name:     "bracket map key glob middle star requires one segment",
+			path:     "properties['unity.catalog.managed.defaults.enableRowTracking']",
+			pattern:  "properties['unity.catalog.managed.*.defaults.enableRowTracking']",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1223,4 +1273,27 @@ paths:
 	err := yaml.Unmarshal([]byte(yamlInput), &config)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unexpected end of input")
+}
+
+func TestMustParsePaths(t *testing.T) {
+	paths := MustParsePaths("bundle.terraform", "resources.jobs.foo.tasks[0]")
+	require.Len(t, paths, 2)
+	assert.Equal(t, "bundle.terraform", paths[0].String())
+	assert.Equal(t, "resources.jobs.foo.tasks[0]", paths[1].String())
+	assert.Empty(t, MustParsePaths())
+}
+
+func TestNewPath(t *testing.T) {
+	assert.Equal(t, "a.b['c d']", NewPath(NewStringKey(nil, "a"), "b", "c d").String())
+	assert.Equal(t, "resources.jobs.j.tasks[2].job_cluster_key", NewPath(nil, "resources", "jobs", "j", "tasks", 2, "job_cluster_key").String())
+	assert.Nil(t, NewPath(nil))
+	assert.Equal(t, "a", NewPath(NewStringKey(nil, "a")).String())
+	assert.Panics(t, func() { NewPath(nil, int64(1)) })
+}
+
+func TestNewPathSlice(t *testing.T) {
+	paths := NewPathSlice("resources", "jobs", "${var.env}_job")
+	require.Len(t, paths, 1)
+	assert.Equal(t, "resources.jobs['${var.env}_job']", paths[0].String())
+	assert.Equal(t, "sync.paths[3]", NewPathSlice("sync", "paths", 3)[0].String())
 }

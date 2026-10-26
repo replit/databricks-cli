@@ -24,21 +24,39 @@ func (e cannotTraverseNilError) Error() string {
 }
 
 func IsCannotTraverseNilError(err error) bool {
-	var target cannotTraverseNilError
-	return errors.As(err, &target)
+	_, ok := errors.AsType[cannotTraverseNilError](err)
+	return ok
 }
 
 type noSuchKeyError struct {
-	p Path
+	p           Path
+	suggestions []string
 }
 
 func (e noSuchKeyError) Error() string {
-	return fmt.Sprintf("key not found at %q", e.p)
+	return fmt.Sprintf("key not found at %q%s", e.p, didYouMean(e.suggestions))
 }
 
 func IsNoSuchKeyError(err error) bool {
-	var target noSuchKeyError
-	return errors.As(err, &target)
+	_, ok := errors.AsType[noSuchKeyError](err)
+	return ok
+}
+
+// SuggestedReferences returns drop-in replacement references for a noSuchKeyError
+// (nil otherwise), rebuilt by swapping the failed segment of reference for each
+// suggestion (e.g. "var.hst" -> ["var.host"]).
+func SuggestedReferences(err error, reference string) []string {
+	e, ok := errors.AsType[noSuchKeyError](err)
+	if !ok || len(e.suggestions) == 0 {
+		return nil
+	}
+	// Last component of e.p is the failed key (same in original and rewritten space).
+	failedKey := e.p[len(e.p)-1].Key()
+	refs := make([]string, len(e.suggestions))
+	for i, s := range e.suggestions {
+		refs[i] = replaceKey(reference, failedKey, s)
+	}
+	return refs
 }
 
 type indexOutOfBoundsError struct {
@@ -50,8 +68,8 @@ func (e indexOutOfBoundsError) Error() string {
 }
 
 func IsIndexOutOfBoundsError(err error) bool {
-	var target indexOutOfBoundsError
-	return errors.As(err, &target)
+	_, ok := errors.AsType[indexOutOfBoundsError](err)
+	return ok
 }
 
 type expectedMapToIndexError struct {
@@ -124,7 +142,7 @@ func (c pathComponent) visit(v Value, prefix Path, suffix Pattern, opts visitOpt
 		// Lookup current value in the map.
 		ev, ok := m.GetByString(c.key)
 		if !ok {
-			return InvalidValue, noSuchKeyError{path}
+			return InvalidValue, noSuchKeyError{p: path, suggestions: suggestKeys(m, c.key)}
 		}
 
 		// Recursively transform the value.

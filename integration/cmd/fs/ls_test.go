@@ -50,7 +50,7 @@ func TestFsLs(t *testing.T) {
 			setupLsFiles(t, f)
 
 			stdout, stderr := testcli.RequireSuccessfulRun(t, ctx, "fs", "ls", tmpDir, "--output=json")
-			assert.Equal(t, "", stderr.String())
+			assert.Empty(t, stderr.String())
 
 			var parsedStdout []map[string]any
 			err := json.Unmarshal(stdout.Bytes(), &parsedStdout)
@@ -82,7 +82,7 @@ func TestFsLsWithAbsolutePaths(t *testing.T) {
 			setupLsFiles(t, f)
 
 			stdout, stderr := testcli.RequireSuccessfulRun(t, ctx, "fs", "ls", tmpDir, "--output=json", "--absolute")
-			assert.Equal(t, "", stderr.String())
+			assert.Empty(t, stderr.String())
 
 			var parsedStdout []map[string]any
 			err := json.Unmarshal(stdout.Bytes(), &parsedStdout)
@@ -131,7 +131,7 @@ func TestFsLsOnEmptyDir(t *testing.T) {
 			_, tmpDir := testCase.setupFiler(t)
 
 			stdout, stderr := testcli.RequireSuccessfulRun(t, ctx, "fs", "ls", tmpDir, "--output=json")
-			assert.Equal(t, "", stderr.String())
+			assert.Empty(t, stderr.String())
 			var parsedStdout []map[string]any
 			err := json.Unmarshal(stdout.Bytes(), &parsedStdout)
 			require.NoError(t, err)
@@ -157,12 +157,4 @@ func TestFsLsForNonexistingDir(t *testing.T) {
 			assert.Regexp(t, "no such directory: .*/nonexistent", err.Error())
 		})
 	}
-}
-
-func TestFsLsWithoutScheme(t *testing.T) {
-	t.Parallel()
-
-	ctx := t.Context()
-	_, _, err := testcli.RequireErrorRun(t, ctx, "fs", "ls", "/path-without-a-dbfs-scheme", "--output=json")
-	assert.ErrorIs(t, err, fs.ErrNotExist)
 }

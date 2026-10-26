@@ -2,7 +2,9 @@ package apps
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"io/fs"
 	"os"
@@ -12,11 +14,15 @@ import (
 	"testing"
 
 	"github.com/databricks/cli/libs/apps/manifest"
+	"github.com/databricks/cli/libs/apps/pkgmanager"
 	"github.com/databricks/cli/libs/apps/prompt"
+	"github.com/databricks/cli/libs/cmdctx"
+	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/env"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestIsTextFile(t *testing.T) {
@@ -88,8 +94,9 @@ func testVars() templateVars {
 			Content: "WH_ID=abc123",
 			Example: "WH_ID=your_sql_warehouse_id",
 		},
-		AppEnv:  "- name: SQL_WAREHOUSE_ID\n  valueFrom: sql_warehouse",
-		Plugins: map[string]*pluginVar{"analytics": {}},
+		AppEnv:         "- name: SQL_WAREHOUSE_ID\n  valueFrom: sql_warehouse",
+		PackageManager: "pnpm",
+		Plugins:        map[string]*pluginVar{"analytics": {}},
 	}
 }
 
@@ -239,6 +246,29 @@ func TestExecuteTemplateNewKeys(t *testing.T) {
 			result, err := executeTemplate(ctx, "test.txt", []byte(tt.input), vars)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expected, string(result))
+		})
+	}
+}
+
+func TestPackageManagerTemplateVariable(t *testing.T) {
+	ctx := t.Context()
+	tests := []struct {
+		name           string
+		packageManager string
+	}{
+		{"pnpm", "pnpm"},
+		{"npm", "npm"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := testVars()
+			vars.PackageManager = tt.packageManager
+			input := "['{{.packageManager}}', 'run', 'start']"
+			result, err := executeTemplate(ctx, "test.yaml", []byte(input), vars)
+			require.NoError(t, err)
+			expected := "['" + tt.packageManager + "', 'run', 'start']"
+			assert.Equal(t, expected, string(result))
 		})
 	}
 }
@@ -443,7 +473,7 @@ func TestNormalizeVersion(t *testing.T) {
 		{"", ""},
 		{"main", "main"},
 		{"feat/something", "feat/something"},
-		{appkitDefaultVersion, appkitDefaultVersion},
+		{"template-v0.24.0", "template-v0.24.0"},
 	}
 
 	for _, tt := range tests {
@@ -977,29 +1007,31 @@ func skipIfNoNpm(t *testing.T) {
 	}
 }
 
-func TestStartBackgroundNpmInstall_NoLockFile(t *testing.T) {
+func TestStartBackgroundInstall_NoLockFile(t *testing.T) {
 	srcDir := t.TempDir()
 	destDir := t.TempDir()
 
 	// Only package.json, no lock file
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package.json"), []byte(`{"name":"test"}`), 0o644))
 
-	ch := startBackgroundNpmInstall(t.Context(), srcDir, destDir, "test-app")
+	m := pkgmanager.Manager{Name: "npm", LockfileNames: []string{"package-lock.json"}}
+	ch := startBackgroundInstall(t.Context(), srcDir, destDir, "test-app", m)
 	assert.Nil(t, ch)
 }
 
-func TestStartBackgroundNpmInstall_NoPackageJSON(t *testing.T) {
+func TestStartBackgroundInstall_NoPackageJSON(t *testing.T) {
 	srcDir := t.TempDir()
 	destDir := t.TempDir()
 
 	// Only lock file, no package.json
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package-lock.json"), []byte(`{}`), 0o644))
 
-	ch := startBackgroundNpmInstall(t.Context(), srcDir, destDir, "test-app")
+	m := pkgmanager.Manager{Name: "npm", LockfileNames: []string{"package-lock.json"}}
+	ch := startBackgroundInstall(t.Context(), srcDir, destDir, "test-app", m)
 	assert.Nil(t, ch)
 }
 
-func TestStartBackgroundNpmInstall_CopiesFiles(t *testing.T) {
+func TestStartBackgroundInstall_CopiesFiles(t *testing.T) {
 	skipIfNoNpm(t)
 
 	srcDir := t.TempDir()
@@ -1010,7 +1042,8 @@ func TestStartBackgroundNpmInstall_CopiesFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package.json"), pkgJSON, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package-lock.json"), lockJSON, 0o644))
 
-	ch := startBackgroundNpmInstall(t.Context(), srcDir, destDir, "my-app")
+	m := pkgmanager.Manager{Name: "npm", LockfileNames: []string{"package-lock.json"}}
+	ch := startBackgroundInstall(t.Context(), srcDir, destDir, "my-app", m)
 	require.NotNil(t, ch)
 
 	// Drain the channel to avoid goroutine leak (npm ci will fail on fake data)
@@ -1028,7 +1061,7 @@ func TestStartBackgroundNpmInstall_CopiesFiles(t *testing.T) {
 	assert.Equal(t, lockJSON, gotLock)
 }
 
-func TestStartBackgroundNpmInstall_CopiesFileDeps(t *testing.T) {
+func TestStartBackgroundInstall_CopiesFileDeps(t *testing.T) {
 	skipIfNoNpm(t)
 
 	srcDir := t.TempDir()
@@ -1042,7 +1075,8 @@ func TestStartBackgroundNpmInstall_CopiesFileDeps(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package.json"), pkgJSON, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package-lock.json"), lockJSON, 0o644))
 
-	ch := startBackgroundNpmInstall(t.Context(), srcDir, destDir, "test-app")
+	m := pkgmanager.Manager{Name: "npm", LockfileNames: []string{"package-lock.json"}}
+	ch := startBackgroundInstall(t.Context(), srcDir, destDir, "test-app", m)
 	require.NotNil(t, ch)
 	<-ch
 
@@ -1052,7 +1086,7 @@ func TestStartBackgroundNpmInstall_CopiesFileDeps(t *testing.T) {
 	assert.Equal(t, tgzContent, copied)
 }
 
-func TestStartBackgroundNpmInstall_TemplateSubstitution(t *testing.T) {
+func TestStartBackgroundInstall_TemplateSubstitution(t *testing.T) {
 	skipIfNoNpm(t)
 
 	srcDir := t.TempDir()
@@ -1063,7 +1097,8 @@ func TestStartBackgroundNpmInstall_TemplateSubstitution(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package.json"), pkgJSON, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package-lock.json"), lockJSON, 0o644))
 
-	ch := startBackgroundNpmInstall(t.Context(), srcDir, destDir, "cool-project")
+	m := pkgmanager.Manager{Name: "npm", LockfileNames: []string{"package-lock.json"}}
+	ch := startBackgroundInstall(t.Context(), srcDir, destDir, "cool-project", m)
 	require.NotNil(t, ch)
 	<-ch
 
@@ -1071,4 +1106,707 @@ func TestStartBackgroundNpmInstall_TemplateSubstitution(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(got), `"cool-project"`)
 	assert.NotContains(t, string(got), "{{.projectName}}")
+}
+
+const (
+	backgroundInstallHelperEnv   = "CLI_TEST_BACKGROUND_INSTALL_MANAGER"
+	backgroundInstallPinEnv      = "CLI_TEST_BACKGROUND_INSTALL_PIN"
+	backgroundInstallLockfileEnv = "CLI_TEST_BACKGROUND_INSTALL_LOCKFILE"
+	backgroundInstallNpmrc       = "enable-pre-post-scripts=true\n"
+	backgroundInstallWorkspace   = "packages:\n  - '.'\noverrides:\n  lodash: 4.17.21\nallowBuilds:\n  esbuild: true\n"
+)
+
+func TestStartBackgroundInstall_PreparesSelectedManager(t *testing.T) {
+	for _, tt := range []struct {
+		manager   string
+		lockfiles []string
+	}{
+		{"npm", []string{"package-lock.json"}},
+		{"npm", []string{"npm-shrinkwrap.json"}},
+		{"npm", []string{"npm-shrinkwrap.json", "package-lock.json"}},
+		{"pnpm", []string{"pnpm-lock.yaml"}},
+	} {
+		for _, configName := range []string{".npmrc", "_npmrc"} {
+			t.Run(tt.manager+"/"+strings.Join(tt.lockfiles, "+")+"/"+configName, func(t *testing.T) {
+				t.Setenv(backgroundInstallHelperEnv, tt.manager)
+				t.Setenv(backgroundInstallLockfileEnv, tt.lockfiles[0])
+				srcDir, destDir := t.TempDir(), t.TempDir()
+				m, err := pkgmanager.Resolve(tt.manager)
+				require.NoError(t, err)
+				if tt.manager == "npm" {
+					m.Pin = "npm@11.4.1"
+				}
+				t.Setenv(backgroundInstallPinEnv, m.Pin)
+				require.NoError(t, os.WriteFile(filepath.Join(srcDir, "package.json"), []byte(`{"name":"{{.projectName}}","packageManager":"yarn@1.22.22"}`), 0o644))
+				for _, name := range tt.lockfiles {
+					require.NoError(t, os.WriteFile(filepath.Join(srcDir, name), []byte("lockfile"), 0o644))
+				}
+				require.NoError(t, os.WriteFile(filepath.Join(srcDir, "pnpm-workspace.yaml"), []byte(backgroundInstallWorkspace), 0o644))
+				require.NoError(t, os.WriteFile(filepath.Join(srcDir, configName), []byte(backgroundInstallNpmrc), 0o644))
+				m.Name, err = os.Executable()
+				require.NoError(t, err)
+				m.InstallArgs = append([]string{"-test.run=^TestBackgroundInstallHelper$", "--"}, m.InstallArgs...)
+
+				ch := startBackgroundInstall(t.Context(), srcDir, destDir, "test-app", m)
+				require.NotNil(t, ch)
+				require.NoError(t, <-ch)
+			})
+		}
+	}
+}
+
+// TestBackgroundInstallHelper checks the files visible to the installer process,
+// so the test does not depend on a locally installed package manager or shell.
+func TestBackgroundInstallHelper(t *testing.T) {
+	manager := os.Getenv(backgroundInstallHelperEnv)
+	if manager == "" {
+		return
+	}
+	m, err := pkgmanager.Resolve(manager)
+	require.NoError(t, err)
+	assert.Equal(t, m.InstallArgs, flag.Args())
+	data, err := os.ReadFile("package.json")
+	require.NoError(t, err)
+	var pkg map[string]any
+	require.NoError(t, json.Unmarshal(data, &pkg))
+	assert.Equal(t, "test-app", pkg["name"])
+	assert.Equal(t, os.Getenv(backgroundInstallPinEnv), pkg["packageManager"])
+	lockfile, err := m.FindLockfile(".")
+	require.NoError(t, err)
+	assert.Equal(t, os.Getenv(backgroundInstallLockfileEnv), lockfile)
+	data, err = os.ReadFile(lockfile)
+	require.NoError(t, err)
+	assert.Equal(t, "lockfile", string(data))
+	data, err = os.ReadFile(".npmrc")
+	require.NoError(t, err)
+	assert.Equal(t, backgroundInstallNpmrc, string(data))
+	if m.WorkspaceConfigName != "" {
+		data, err = os.ReadFile(m.WorkspaceConfigName)
+		require.NoError(t, err)
+		assert.Equal(t, backgroundInstallWorkspace, string(data))
+	} else {
+		assert.NoFileExists(t, "pnpm-workspace.yaml")
+	}
+}
+
+// makeChildDir creates and returns an empty subdirectory of t.TempDir() with
+// the requested name. Used to control filepath.Base(cwd) for in-place tests.
+func makeChildDir(t *testing.T, name string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	return dir
+}
+
+func TestCommitInPlace_Success(t *testing.T) {
+	dir := makeChildDir(t, "my-app")
+	t.Chdir(dir)
+
+	name, err := commitInPlace()
+	require.NoError(t, err)
+	assert.Equal(t, "my-app", name)
+}
+
+func TestCommitInPlace_AllowsDotGit(t *testing.T) {
+	dir := makeChildDir(t, "my-app")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".git"), 0o755))
+	t.Chdir(dir)
+
+	name, err := commitInPlace()
+	require.NoError(t, err)
+	assert.Equal(t, "my-app", name)
+}
+
+func TestCommitInPlace_RejectsPreExistingGitignore(t *testing.T) {
+	// The template ships _gitignore that renames to .gitignore on copy.
+	// Allowing a pre-existing .gitignore would silently destroy the user's
+	// file via os.WriteFile, so we refuse the directory up front.
+	dir := makeChildDir(t, "my-app")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("node_modules\n"), 0o644))
+	t.Chdir(dir)
+
+	_, err := commitInPlace()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not empty")
+}
+
+func TestCommitInPlace_RejectsStrayFiles(t *testing.T) {
+	dir := makeChildDir(t, "my-app")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.md"), []byte("hi"), 0o644))
+	t.Chdir(dir)
+
+	_, err := commitInPlace()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not empty")
+}
+
+func TestCommitInPlace_RejectsInvalidBasename(t *testing.T) {
+	dir := makeChildDir(t, "My_App")
+	t.Chdir(dir)
+
+	_, err := commitInPlace()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "My_App")
+}
+
+func TestRunCreate_NameDotAndOutputDirAreMutuallyExclusive(t *testing.T) {
+	dir := makeChildDir(t, "my-app")
+	t.Chdir(dir)
+
+	ctx := cmdio.MockDiscard(t.Context())
+	err := runCreate(ctx, createOptions{
+		name:           prompt.InPlaceName,
+		nameProvided:   true,
+		outputDir:      "elsewhere",
+		packageManager: "pnpm",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, prompt.ErrNameDotWithOutputDir)
+}
+
+func TestRunCreate_SkipInstallRejectsRun(t *testing.T) {
+	ctx := cmdio.MockDiscard(t.Context())
+	for _, runMode := range []string{"dev", "dev-remote"} {
+		t.Run(runMode, func(t *testing.T) {
+			err := runCreate(ctx, createOptions{
+				name:           "my-app",
+				nameProvided:   true,
+				skipInstall:    true,
+				run:            runMode,
+				packageManager: "pnpm",
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "--skip-install cannot be combined with --run")
+		})
+	}
+}
+
+func TestRunCreateCleansUpPartialScaffold(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		files   map[string]string
+		manager string
+		wantErr string
+	}{
+		{
+			name:    "copy",
+			files:   map[string]string{"a.txt": "copied first", "z/child.txt": "directory", "z.tmpl": "conflicts with directory"},
+			wantErr: "open ",
+		},
+		{
+			name:    "prune",
+			files:   map[string]string{"package.json": `{}`, "package-lock.json": `{}`, "pnpm-lock.yaml/child.txt": "cannot remove nonempty directory"},
+			manager: "npm",
+			wantErr: "prune package manager artifacts",
+		},
+		{
+			name:    "package JSON",
+			files:   map[string]string{"package.json": `null`},
+			wantErr: "update package.json",
+		},
+		{
+			name:    "bundle YAML",
+			files:   map[string]string{"appkit.plugins.json": `{"plugins":{}}`, "databricks.yml": "bundle: ["},
+			wantErr: "update project name",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			src, output := t.TempDir(), t.TempDir()
+			for name, content := range tt.files {
+				path := filepath.Join(src, filepath.FromSlash(name))
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+				require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+			}
+			ctx := cmdctx.SetWorkspaceClient(cmdio.MockDiscard(t.Context()), nil)
+			err := runCreate(ctx, createOptions{
+				templatePath:          src,
+				name:                  "test-app",
+				nameProvided:          true,
+				outputDir:             output,
+				skipInstall:           true,
+				packageManager:        tt.manager,
+				packageManagerChanged: tt.manager != "",
+			})
+			require.ErrorContains(t, err, tt.wantErr)
+			assert.NoDirExists(t, filepath.Join(output, "test-app"))
+			assert.DirExists(t, src)
+		})
+	}
+}
+
+func TestInitCmd_SkipInstallFlagRegistered(t *testing.T) {
+	cmd := newInitCmd()
+	flag := cmd.Flags().Lookup("skip-install")
+	require.NotNil(t, flag)
+	assert.Equal(t, "false", flag.DefValue)
+}
+
+func TestPrependInstall(t *testing.T) {
+	tests := []struct {
+		name      string
+		install   string
+		nextSteps string
+		want      string
+	}{
+		{"both set", "npm ci", "npm run dev", "npm ci && npm run dev"},
+		{"empty install", "", "npm run dev", "npm run dev"},
+		{"empty next steps", "npm ci", "", "npm ci"},
+		{"both empty", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, prependInstall(tt.install, tt.nextSteps))
+		})
+	}
+}
+
+func TestShouldSkipPluginSelection(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(dir string)
+		expected bool
+	}{
+		{
+			name: "pre-rendered: manifest + databricks.yml + no project_name dir",
+			setup: func(dir string) {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, manifest.ManifestFileName), []byte(`{"plugins":{}}`), 0o644))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, bundleConfigFile), []byte("bundle:\n  name: myapp\n"), 0o644))
+			},
+			expected: true,
+		},
+		{
+			name: "full appkit template: manifest + no databricks.yml",
+			setup: func(dir string) {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, manifest.ManifestFileName), []byte(`{"plugins":{}}`), 0o644))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "databricks.yml.tmpl"), []byte("bundle:\n  name: {{.projectName}}\n"), 0o644))
+			},
+			expected: false,
+		},
+		{
+			name: "manifest present, project_name dir present",
+			setup: func(dir string) {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, manifest.ManifestFileName), []byte(`{"plugins":{}}`), 0o644))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, bundleConfigFile), []byte("bundle:\n  name: myapp\n"), 0o644))
+				require.NoError(t, os.MkdirAll(filepath.Join(dir, "{{.project_name}}"), 0o755))
+			},
+			expected: false,
+		},
+		{
+			name: "no manifest",
+			setup: func(dir string) {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644))
+			},
+			expected: false,
+		},
+		{
+			name:     "unreadable directory",
+			setup:    func(_ string) {},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.name == "unreadable directory" {
+				dir = filepath.Join(dir, "nonexistent")
+			} else {
+				tt.setup(dir)
+			}
+			assert.Equal(t, tt.expected, shouldSkipPluginSelection(t.Context(), dir))
+		})
+	}
+}
+
+func TestReplaceProjectName(t *testing.T) {
+	tests := []struct {
+		name           string
+		yml            string
+		pkgJSON        string // empty means no package.json
+		newName        string
+		wantBundleName string
+		wantAppName    string
+		wantPkgName    string
+		wantErr        bool
+	}{
+		{
+			name:           "bundle and app name replaced",
+			yml:            "bundle:\n  name: old-app\nresources:\n  apps:\n    old-app:\n      name: \"old-app\"\n",
+			newName:        "new-app",
+			wantBundleName: "new-app",
+			wantAppName:    "new-app",
+		},
+		{
+			name:           "bundle name only, no resources",
+			yml:            "bundle:\n  name: old-app\n",
+			newName:        "new-app",
+			wantBundleName: "new-app",
+		},
+		{
+			name:    "no bundle.name, only app name",
+			yml:     "resources:\n  apps:\n    myapp:\n      name: \"myapp\"\n",
+			newName: "new-app",
+			wantErr: true,
+		},
+		{
+			name:           "package.json round-trip",
+			yml:            "bundle:\n  name: old-app\n",
+			pkgJSON:        `{"name":"old-app","version":"1.0.0"}`,
+			newName:        "new-app",
+			wantBundleName: "new-app",
+			wantPkgName:    "new-app",
+		},
+		{
+			name:           "no package.json",
+			yml:            "bundle:\n  name: old-app\n",
+			newName:        "new-app",
+			wantBundleName: "new-app",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+
+			require.NoError(t, os.WriteFile(filepath.Join(dir, bundleConfigFile), []byte(tt.yml), 0o644))
+
+			if tt.pkgJSON != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "package.json"), []byte(tt.pkgJSON), 0o644))
+			}
+
+			err := replaceProjectName(dir, tt.newName, pkgmanager.Default())
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			// Verify databricks.yml via yaml.Node to avoid format sensitivity.
+			ymlData, err := os.ReadFile(filepath.Join(dir, bundleConfigFile))
+			require.NoError(t, err)
+
+			var doc yaml.Node
+			require.NoError(t, yaml.Unmarshal(ymlData, &doc))
+
+			if tt.wantBundleName != "" {
+				bundleName := yamlMapLookup(yamlMapLookup(doc.Content[0], "bundle"), "name")
+				require.NotNil(t, bundleName, "bundle.name not found in output")
+				assert.Equal(t, tt.wantBundleName, bundleName.Value)
+			}
+
+			if tt.wantAppName != "" {
+				appsNode := yamlMapLookup(yamlMapLookup(doc.Content[0], "resources"), "apps")
+				require.NotNil(t, appsNode)
+				require.True(t, appsNode.Kind == yaml.MappingNode && len(appsNode.Content) >= 2)
+				appName := yamlMapLookup(appsNode.Content[1], "name")
+				require.NotNil(t, appName, "resources.apps.*.name not found in output")
+				assert.Equal(t, tt.wantAppName, appName.Value)
+			}
+
+			if tt.wantPkgName != "" {
+				pkgData, err := os.ReadFile(filepath.Join(dir, "package.json"))
+				require.NoError(t, err)
+				var pkg map[string]any
+				require.NoError(t, json.Unmarshal(pkgData, &pkg))
+				assert.Equal(t, tt.wantPkgName, pkg["name"])
+			}
+		})
+	}
+}
+
+func TestReplaceProjectNameNoDatabricksYml(t *testing.T) {
+	dir := t.TempDir()
+	err := replaceProjectName(dir, "new-app", pkgmanager.Default())
+	require.Error(t, err)
+}
+
+func TestReplaceProjectNameMalformedYAML(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, bundleConfigFile), []byte("{{invalid yaml"), 0o644))
+	err := replaceProjectName(dir, "new-app", pkgmanager.Default())
+	assert.ErrorContains(t, err, "parse")
+}
+
+func TestReplaceProjectNameMalformedPackageJSON(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, bundleConfigFile), []byte("bundle:\n  name: old\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "package.json"), []byte("{invalid json}"), 0o644))
+	err := replaceProjectName(dir, "new-app", pkgmanager.Default())
+	assert.ErrorContains(t, err, "parse package.json")
+}
+
+func TestReplaceProjectNameSymlinkRefused(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a real file and a symlink to it named databricks.yml.
+	realFile := filepath.Join(dir, "real.yml")
+	require.NoError(t, os.WriteFile(realFile, []byte("bundle:\n  name: old\n"), 0o644))
+	require.NoError(t, os.Symlink(realFile, filepath.Join(dir, bundleConfigFile)))
+
+	err := replaceProjectName(dir, "new-app", pkgmanager.Default())
+	assert.ErrorContains(t, err, "symlink")
+}
+
+func TestSetYAMLValue(t *testing.T) {
+	input := "top:\n  nested:\n    leaf: old\n"
+	var doc yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(input), &doc))
+
+	require.NoError(t, setYAMLValue(&doc, []string{"top", "nested", "leaf"}, "new"))
+
+	val := yamlMapLookup(yamlMapLookup(yamlMapLookup(doc.Content[0], "top"), "nested"), "leaf")
+	require.NotNil(t, val)
+	assert.Equal(t, "new", val.Value)
+}
+
+func TestSetYAMLValueMissingKey(t *testing.T) {
+	input := "top:\n  nested:\n    leaf: old\n"
+	var doc yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(input), &doc))
+
+	err := setYAMLValue(&doc, []string{"top", "nonexistent", "leaf"}, "new")
+	assert.Error(t, err)
+
+	val := yamlMapLookup(yamlMapLookup(yamlMapLookup(doc.Content[0], "top"), "nested"), "leaf")
+	require.NotNil(t, val)
+	assert.Equal(t, "old", val.Value)
+}
+
+func TestSetYAMLValueNonScalarLeaf(t *testing.T) {
+	input := "bundle:\n  name:\n    nested: value\n"
+	var doc yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(input), &doc))
+
+	err := setYAMLValue(&doc, []string{"bundle", "name"}, "new-name")
+	assert.ErrorContains(t, err, "expected scalar")
+}
+
+func TestYamlMapLookup(t *testing.T) {
+	input := "a: 1\nb: 2\n"
+	var doc yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(input), &doc))
+
+	root := doc.Content[0]
+	assert.NotNil(t, yamlMapLookup(root, "a"))
+	assert.Equal(t, "1", yamlMapLookup(root, "a").Value)
+	assert.Nil(t, yamlMapLookup(root, "missing"))
+	assert.Nil(t, yamlMapLookup(nil, "a"))
+}
+
+func TestSetFirstAppName(t *testing.T) {
+	input := "resources:\n  apps:\n    myapp:\n      name: \"old-name\"\n      description: keep\n"
+	var doc yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(input), &doc))
+
+	require.NoError(t, setFirstAppName(&doc, "new-name"))
+
+	appsNode := yamlMapLookup(yamlMapLookup(doc.Content[0], "resources"), "apps")
+	require.NotNil(t, appsNode)
+	appName := yamlMapLookup(appsNode.Content[1], "name")
+	require.NotNil(t, appName)
+	assert.Equal(t, "new-name", appName.Value)
+
+	// Verify description is untouched.
+	desc := yamlMapLookup(appsNode.Content[1], "description")
+	require.NotNil(t, desc)
+	assert.Equal(t, "keep", desc.Value)
+}
+
+func TestSetFirstAppNameNoResources(t *testing.T) {
+	input := "bundle:\n  name: myapp\n"
+	var doc yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(input), &doc))
+
+	// No error when resources.apps is absent.
+	require.NoError(t, setFirstAppName(&doc, "new-name"))
+
+	bundleName := yamlMapLookup(yamlMapLookup(doc.Content[0], "bundle"), "name")
+	require.NotNil(t, bundleName)
+	assert.Equal(t, "myapp", bundleName.Value)
+}
+
+func authModeManifest() *manifest.Manifest {
+	return &manifest.Manifest{
+		Plugins: map[string]manifest.Plugin{
+			"analytics": {
+				Name: "analytics",
+				Resources: manifest.Resources{
+					Required: []manifest.Resource{
+						{Type: "sql_warehouse", ResourceKey: "sql-warehouse", Scope: "sql", PluginName: "analytics", Fields: map[string]manifest.ResourceField{"id": {}}},
+						{Type: "secret", ResourceKey: "secret", AppOnly: true, PluginName: "analytics", Fields: map[string]manifest.ResourceField{"scope": {}, "key": {}}},
+					},
+				},
+			},
+			"jobs": {
+				Name: "jobs",
+				Resources: manifest.Resources{
+					Required: []manifest.Resource{
+						{Type: "job", ResourceKey: "job", PluginName: "jobs", Fields: map[string]manifest.ResourceField{"id": {}}},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestParseSetAuthModes(t *testing.T) {
+	m := authModeManifest()
+	tests := []struct {
+		name      string
+		setValues []string
+		want      map[string]string
+		wantErr   string
+	}{
+		{name: "values ignored", setValues: []string{"analytics.sql-warehouse.id=wh"}, want: map[string]string{}},
+		{name: "obo", setValues: []string{"analytics.sql-warehouse.authMode=obo"}, want: map[string]string{"sql_warehouse:sql-warehouse": "obo"}},
+		{name: "both", setValues: []string{"analytics.sql-warehouse.authMode=both"}, want: map[string]string{"sql_warehouse:sql-warehouse": "both"}},
+		{name: "sp without scope", setValues: []string{"jobs.job.authMode=sp"}, want: map[string]string{"job:job": "sp"}},
+		{name: "invalid value", setValues: []string{"analytics.sql-warehouse.authMode=user"}, wantErr: "invalid auth mode"},
+		{name: "unknown resource", setValues: []string{"analytics.nope.authMode=obo"}, wantErr: "no resource with key"},
+		{name: "app only", setValues: []string{"analytics.secret.authMode=sp"}, wantErr: "always accessed by the app's service principal"},
+		{name: "obo without scope", setValues: []string{"jobs.job.authMode=obo"}, wantErr: "cannot be accessed on behalf of the user"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseSetAuthModes(tt.setValues, m)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	// parseSetValues must accept and skip the authMode pseudo-field.
+	rv, err := parseSetValues([]string{"analytics.sql-warehouse.authMode=obo", "analytics.sql-warehouse.id=wh"}, m)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"sql-warehouse.id": "wh"}, rv)
+}
+
+func TestResolveAuthModes(t *testing.T) {
+	m := authModeManifest()
+	resources := m.CollectResources([]string{"analytics", "jobs"})
+
+	got, keptSP := resolveAuthModes(resources, nil, nil, "")
+	assert.Empty(t, got)
+	assert.Empty(t, keptSP)
+
+	// The --auth-mode obo default skips resources without a scope and app-only resources.
+	got, keptSP = resolveAuthModes(resources, nil, nil, "obo")
+	assert.Equal(t, map[string]string{"sql_warehouse:sql-warehouse": "obo"}, got)
+	assert.Equal(t, []string{"secret", "job"}, keptSP)
+
+	// An explicit --set wins and is not reported as kept on sp.
+	got, keptSP = resolveAuthModes(resources, map[string]string{"job:job": "sp", "sql_warehouse:sql-warehouse": "sp"}, nil, "obo")
+	assert.Empty(t, got)
+	assert.Equal(t, []string{"secret"}, keptSP)
+
+	got, _ = resolveAuthModes(resources, map[string]string{"sql_warehouse:sql-warehouse": "both"}, map[string]string{"sql_warehouse:sql-warehouse": "obo"}, "")
+	assert.Equal(t, map[string]string{"sql_warehouse:sql-warehouse": "both"}, got)
+
+	got, _ = resolveAuthModes(resources, nil, map[string]string{"sql_warehouse:sql-warehouse": "obo"}, "")
+	assert.Equal(t, map[string]string{"sql_warehouse:sql-warehouse": "obo"}, got)
+}
+
+func TestResourceConfigured(t *testing.T) {
+	r := manifest.Resource{ResourceKey: "wh", Fields: map[string]manifest.ResourceField{"id": {}}}
+	assert.False(t, resourceConfigured(r, nil))
+	assert.False(t, resourceConfigured(r, map[string]string{"other.id": "x"}))
+	assert.True(t, resourceConfigured(r, map[string]string{"wh.id": "x"}))
+}
+
+func TestFindMissingBindingValues(t *testing.T) {
+	genieIDOnly := manifest.Resource{Type: "genie_space", ResourceKey: "genie-space", PluginName: "genie", Scope: "genie", Fields: map[string]manifest.ResourceField{"id": {}}}
+	warehouse := manifest.Resource{Type: "sql_warehouse", ResourceKey: "sql-warehouse", PluginName: "analytics", Scope: "sql", Fields: map[string]manifest.ResourceField{"id": {}}}
+	resources := []manifest.Resource{warehouse, genieIDOnly}
+	values := map[string]string{"sql-warehouse.id": "wh", "genie-space.id": "g123"}
+
+	tests := []struct {
+		name    string
+		modes   map[string]string
+		values  map[string]string
+		wantErr []string
+	}{
+		{
+			name:    "sp: undeclared binding field without a value",
+			values:  values,
+			wantErr: []string{"missing value for genie.genie-space.name (needed by the genie_space binding); use --set genie.genie-space.name=value"},
+		},
+		{
+			name:    "both: still bound",
+			modes:   map[string]string{genieIDOnly.AuthKey(): "both"},
+			values:  values,
+			wantErr: []string{"missing value for genie.genie-space.name (needed by the genie_space binding); use --set genie.genie-space.name=value"},
+		},
+		{
+			name:   "sp with the value set",
+			values: map[string]string{"sql-warehouse.id": "wh", "genie-space.id": "g123", "genie-space.name": "space"},
+		},
+		{
+			name:   "obo: no binding",
+			modes:  map[string]string{genieIDOnly.AuthKey(): "obo", warehouse.AuthKey(): "obo"},
+			values: values,
+		},
+		{
+			name:   "mixed: only the sp resource is checked",
+			modes:  map[string]string{genieIDOnly.AuthKey(): "obo"},
+			values: values,
+		},
+		{
+			name:   "resources without any value are left to validateRequiredResources",
+			values: map[string]string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, mv := range findMissingBindingValues(resources, tt.values, tt.modes) {
+				got = append(got, mv.Error())
+			}
+			assert.Equal(t, tt.wantErr, got)
+		})
+	}
+}
+
+func TestParseSetValuesAcceptsBindingField(t *testing.T) {
+	m := &manifest.Manifest{Plugins: map[string]manifest.Plugin{
+		"genie": {Name: "genie", Resources: manifest.Resources{Required: []manifest.Resource{
+			{Type: "genie_space", ResourceKey: "genie-space", Fields: map[string]manifest.ResourceField{"id": {}}},
+		}}},
+	}}
+	rv, err := parseSetValues([]string{"genie.genie-space.id=g123", "genie.genie-space.name=space"}, m)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"genie-space.id": "g123", "genie-space.name": "space"}, rv)
+
+	_, err = parseSetValues([]string{"genie.genie-space.other=x"}, m)
+	assert.ErrorContains(t, err, `no resource with key "genie-space" and field "other"`)
+}
+
+func TestPackageManagerValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		packageManager string
+		shouldError    bool
+		errorMsg       string
+	}{
+		{"pnpm valid", "pnpm", false, ""},
+		{"npm valid", "npm", false, ""},
+		{"unknown invalid", "unknown", true, "unknown package manager"},
+		{"empty defaults to pnpm", "", false, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test the package manager resolver directly
+			_, err := pkgmanager.Resolve(tt.packageManager)
+			if tt.shouldError {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errorMsg)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

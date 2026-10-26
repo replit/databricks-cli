@@ -1,0 +1,7 @@
+RecordRequests = true
+
+# Starting warehouses can take a while on infra under load.
+# Omit this test to avoid timeouts.
+Cloud = false
+
+Ignore = [".databricks", "databricks.yml"]

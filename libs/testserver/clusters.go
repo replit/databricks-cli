@@ -22,6 +22,8 @@ func (s *FakeWorkspace) ClustersCreate(req Request) any {
 
 	clusterId := nextUUID()
 	request.ClusterId = clusterId
+	// Clusters start in PENDING state when created; ClustersGet transitions them to RUNNING.
+	request.State = compute.StatePending
 
 	// Match cloud behavior: SINGLE_USER clusters automatically get single_user_name set
 	// to the current user. This enables terraform drift detection when the bundle config
@@ -30,7 +32,23 @@ func (s *FakeWorkspace) ClustersCreate(req Request) any {
 		request.SingleUserName = s.CurrentUser().UserName
 	}
 
+	// Apply the attached cluster policy before computing defaults, matching the backend:
+	// policy values feed the defaults below (e.g. driver_node_type_id from node_type_id).
+	if msg := s.applyClusterPolicy(&request, request.PolicyId, applyPolicyDefaultValues(req.Body)); msg != "" {
+		return Response{
+			StatusCode: 400,
+			Body: map[string]string{
+				"error_code": "INVALID_PARAMETER_VALUE",
+				"message":    msg,
+			},
+		}
+	}
 	clusterFixUps(&request)
+
+	// The cluster GET API returns apply_policy_default_values only under .spec, not at the top
+	// level (compute.ClusterDetails has no such field, so it is dropped by the unmarshal above).
+	// Snapshot it from the raw body so re-reads match cloud.
+	request.Spec = specSnapshot(req.Body)
 
 	s.Clusters[clusterId] = request
 
@@ -38,6 +56,23 @@ func (s *FakeWorkspace) ClustersCreate(req Request) any {
 		Body: compute.ClusterDetails{
 			ClusterId: clusterId,
 		},
+	}
+}
+
+// specSnapshot mirrors how the cluster GET API returns apply_policy_default_values under .spec
+// (it is absent from compute.ClusterDetails and thus invisible at the top level of a re-read).
+// Returns nil when the field is unset so re-reads of clusters that don't use it are unchanged;
+// a nil .spec reads back as false, which is what the field's absence means anyway.
+func specSnapshot(body []byte) *compute.ClusterSpec {
+	var spec compute.ClusterSpec
+	if err := json.Unmarshal(body, &spec); err != nil {
+		return nil
+	}
+	if !spec.ApplyPolicyDefaultValues {
+		return nil
+	}
+	return &compute.ClusterSpec{
+		ApplyPolicyDefaultValues: true,
 	}
 }
 
@@ -54,6 +89,14 @@ func (s *FakeWorkspace) ClustersResize(req Request) any {
 	cluster, ok := s.Clusters[request.ClusterId]
 	if !ok {
 		return Response{StatusCode: 404}
+	}
+
+	// Only running clusters can be resized; match the real API behavior.
+	if cluster.State != compute.StateRunning {
+		return Response{
+			StatusCode: 400,
+			Body:       map[string]string{"error_code": "INVALID_STATE", "message": "Cluster is not running"},
+		}
 	}
 
 	cluster.NumWorkers = request.NumWorkers
@@ -73,12 +116,28 @@ func (s *FakeWorkspace) ClustersEdit(req Request) any {
 	}
 
 	defer s.LockUnlock()()
-	_, ok := s.Clusters[request.ClusterId]
+	existing, ok := s.Clusters[request.ClusterId]
 	if !ok {
 		return Response{StatusCode: 404}
 	}
 
+	// Preserve runtime-only fields that the Edit API request doesn't include.
+	request.State = existing.State
+	request.ClusterId = existing.ClusterId
+	// Apply the attached cluster policy before computing defaults, matching the backend:
+	// policy values feed the defaults below (e.g. driver_node_type_id from node_type_id).
+	if msg := s.applyClusterPolicy(&request, request.PolicyId, applyPolicyDefaultValues(req.Body)); msg != "" {
+		return Response{
+			StatusCode: 400,
+			Body: map[string]string{
+				"error_code": "INVALID_PARAMETER_VALUE",
+				"message":    msg,
+			},
+		}
+	}
 	clusterFixUps(&request)
+	// Refresh the .spec snapshot from the new settings, matching cloud behavior on edit.
+	request.Spec = specSnapshot(req.Body)
 	s.Clusters[request.ClusterId] = request
 
 	// Clear venv cache when cluster is edited to match cloud behavior where
@@ -130,9 +189,38 @@ func (s *FakeWorkspace) ClustersGet(req Request, clusterId string) any {
 		return Response{StatusCode: 404}
 	}
 
+	// Simulate cluster startup: transition PENDING → RUNNING so that WaitGetClusterRunning
+	// resolves without hanging. Real clusters move through these states asynchronously.
+	if cluster.State == compute.StatePending {
+		cluster.State = compute.StateRunning
+		s.Clusters[clusterId] = cluster
+	}
+
 	return Response{
 		Body: cluster,
 	}
+}
+
+// ClustersDelete terminates a cluster (sets state to TERMINATED without removing it).
+func (s *FakeWorkspace) ClustersDelete(req Request) any {
+	var request compute.DeleteCluster
+	if err := json.Unmarshal(req.Body, &request); err != nil {
+		return Response{
+			StatusCode: 400,
+			Body:       fmt.Sprintf("request parsing error: %s", err),
+		}
+	}
+	defer s.LockUnlock()()
+
+	cluster, ok := s.Clusters[request.ClusterId]
+	if !ok {
+		return Response{StatusCode: 404}
+	}
+
+	cluster.State = compute.StateTerminated
+	s.Clusters[request.ClusterId] = cluster
+
+	return Response{}
 }
 
 func (s *FakeWorkspace) ClustersStart(req Request) any {

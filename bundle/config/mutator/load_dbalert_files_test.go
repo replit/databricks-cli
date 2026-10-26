@@ -10,7 +10,7 @@ import (
 	"github.com/databricks/cli/bundle/config/mutator"
 	"github.com/databricks/cli/bundle/config/resources"
 	"github.com/databricks/cli/bundle/internal/bundletest"
-	"github.com/databricks/cli/libs/dyn"
+	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/databricks-sdk-go/service/sql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,7 +66,7 @@ func TestLoadDBAlertFiles(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, "resources.alerts.my_alert", []dyn.Location{{
+	bundletest.SetLocation(b, "resources.alerts.my_alert", []diag.Location{{
 		File: filepath.Join(dir, "databricks.yml"),
 	}})
 
@@ -78,4 +78,43 @@ func TestLoadDBAlertFiles(t *testing.T) {
 	assert.Equal(t, "Test Alert", b.Config.Resources.Alerts["my_alert"].DisplayName)
 	assert.Equal(t, "abc123", b.Config.Resources.Alerts["my_alert"].WarehouseId)
 	assert.Equal(t, "SELECT * FROM table\nWHERE value > 100\n", b.Config.Resources.Alerts["my_alert"].QueryText)
+}
+
+func TestLoadDBAlertFilesRelativeToBundleRoot(t *testing.T) {
+	dir := t.TempDir()
+
+	alertJSON := `{
+  "query_lines": [
+    "SELECT 1"
+  ]
+}`
+
+	err := os.WriteFile(filepath.Join(dir, "alert.dbalert.json"), []byte(alertJSON), 0o644)
+	require.NoError(t, err)
+
+	b := &bundle.Bundle{
+		BundleRootPath: dir,
+		Config: config.Root{
+			Resources: config.Resources{
+				Alerts: map[string]*resources.Alert{
+					"my_alert": {
+						FilePath: "alert.dbalert.json",
+						AlertV2: sql.AlertV2{
+							DisplayName: "Test Alert",
+							WarehouseId: "abc123",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	bundletest.SetLocation(b, "resources.alerts.my_alert", []diag.Location{{
+		File: filepath.Join(dir, "databricks.yml"),
+	}})
+
+	diags := bundle.Apply(t.Context(), b, mutator.LoadDBAlertFiles())
+	require.NoError(t, diags.Error())
+
+	assert.Equal(t, "SELECT 1\n", b.Config.Resources.Alerts["my_alert"].QueryText)
 }

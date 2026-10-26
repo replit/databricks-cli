@@ -36,6 +36,10 @@ func New() *cobra.Command {
 		RunE:    root.ReportUnknownSubcommand,
 	}
 
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
 	// Add methods
 	cmd.AddCommand(newCreate())
 	cmd.AddCommand(newDelete())
@@ -86,6 +90,8 @@ func newCreate() *cobra.Command {
   to the Databricks account.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(0)
@@ -155,6 +161,8 @@ func newDelete() *cobra.Command {
     ID: Unique ID for a user in the Databricks account.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -219,6 +227,8 @@ func newGet() *cobra.Command {
     ID: Unique ID for a user in the Databricks account.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -292,6 +302,8 @@ func newList() *cobra.Command {
   Gets details for all the users associated with a Databricks account.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(0)
@@ -351,12 +363,15 @@ func newPatch() *cobra.Command {
 	cmd.Long = `Update user details.
 
   Partially updates a user resource by applying the supplied operations on
-  specific user attributes.
+  specific user attributes. The userName and emails attributes cannot be
+  updated through this API; any supplied changes to them are ignored (no-op).
 
   Arguments:
     ID: Unique ID in the Databricks workspace.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -430,12 +445,16 @@ func newUpdate() *cobra.Command {
 	cmd.Short = `Replace a user.`
 	cmd.Long = `Replace a user.
 
-  Replaces a user's information with the data supplied in request.
+  Replaces a user's information with the data supplied in request. The
+  userName and emails attributes cannot be updated through this API; any
+  supplied changes to them are ignored (no-op).
 
   Arguments:
     ID: Databricks user ID.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)

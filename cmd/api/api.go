@@ -1,6 +1,9 @@
 package api
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +14,9 @@ import (
 	"github.com/databricks/cli/cmd/root"
 	"github.com/databricks/cli/libs/auth"
 	"github.com/databricks/cli/libs/cmdio"
+	"github.com/databricks/cli/libs/databrickscfg"
+	"github.com/databricks/cli/libs/databrickscfg/profile"
+	"github.com/databricks/cli/libs/env"
 	"github.com/databricks/cli/libs/flags"
 	"github.com/databricks/databricks-sdk-go/client"
 	"github.com/databricks/databricks-sdk-go/config"
@@ -18,17 +24,18 @@ import (
 )
 
 const (
-	// orgIDHeader is the workspace routing identifier sent on workspace-scope
-	// requests against unified hosts. Generated SDK service methods set this
-	// per-call when cfg.WorkspaceID is populated; we mirror the same idiom.
-	orgIDHeader = "X-Databricks-Org-Id"
-
-	// orgIDQueryParam is the SPOG (single-page-of-glass) URL convention used
-	// by the Databricks UI: "?o=<workspace-id>" identifies the workspace a URL
-	// targets. When present on the path, we treat it as a per-call override
-	// for the workspace routing identifier so that pasted SPOG URLs route
-	// correctly without requiring --workspace-id.
-	orgIDQueryParam = "o"
+	// orgIDQueryParam and workspaceIDQueryParam are the SPOG
+	// (single-page-of-glass) URL convention used by the Databricks UI:
+	// "?o=<workspace-id>" or "?w=<workspace-id>" identifies the workspace a
+	// URL targets. When present on the path, we treat it as a per-call
+	// override for the workspace routing identifier so that pasted SPOG URLs
+	// route correctly without requiring --workspace-id. "w" is the new
+	// spelling that matches the X-Databricks-Workspace-Id header; "o" stays
+	// accepted for URLs already pasted from older UI builds, shell history,
+	// or committed databricks.yml files. "o" takes precedence when both are
+	// present to preserve the meaning of existing URLs.
+	orgIDQueryParam       = "o"
+	workspaceIDQueryParam = "w"
 )
 
 // accountSegmentRe matches a non-empty segment immediately after "accounts/",
@@ -69,19 +76,34 @@ func makeCommand(method string) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
 
-			var request any
-			diags := payload.Unmarshal(&request)
-			if diags.HasError() {
-				return diags.Error()
+			request, err := buildRequestBody(method, &payload)
+			if err != nil {
+				return err
 			}
 
 			cfg := &config.Config{}
 
-			// command-line flag can specify the profile in use
+			// Profile precedence, mirroring MustWorkspaceClient: --profile flag,
+			// then DATABRICKS_CONFIG_PROFILE (set here so our error messages name
+			// the same profile the SDK loads), then the default profile below.
 			profileFlag := cmd.Flag("profile")
-			if profileFlag != nil {
+			hasProfileFlag := profileFlag != nil && profileFlag.Value.String() != ""
+			if hasProfileFlag {
 				cfg.Profile = profileFlag.Value.String()
 			}
+			if cfg.Profile == "" {
+				cfg.Profile = env.Get(cmd.Context(), "DATABRICKS_CONFIG_PROFILE")
+			}
+
+			if hasProfileFlag {
+				// An explicit --profile wins over auth env vars; its host makes env
+				// host normalization moot (#5096).
+				cfg.Loaders = databrickscfg.ProfileAuthLoaders
+			} else {
+				auth.NormalizeDatabricksConfigFromEnv(cmd.Context(), cfg)
+			}
+			// Skips the default profile when DATABRICKS_HOST is set (#5616).
+			root.ResolveDefaultProfile(cmd.Context(), cfg)
 
 			api, err := client.New(cfg)
 			if err != nil {
@@ -101,15 +123,19 @@ func makeCommand(method string) *cobra.Command {
 
 			headers := map[string]string{"Content-Type": "application/json"}
 			if orgID != "" {
-				headers[orgIDHeader] = orgID
+				headers[auth.WorkspaceIDHeader] = orgID
 			}
 
-			var response any
+			// A *json.RawMessage target copies the response bytes verbatim
+			// (exact integers, key order, unescaped characters) while keeping
+			// the SDK's JSON handling: it sends Accept: application/json and
+			// maps an HTML or non-JSON body to an actionable error.
+			var response json.RawMessage
 			err = api.Do(cmd.Context(), method, path, headers, nil, request, &response)
 			if err != nil {
 				return err
 			}
-			return cmdio.Render(cmd.Context(), response)
+			return renderResponse(cmd.Context(), response)
 		},
 	}
 
@@ -121,6 +147,58 @@ func makeCommand(method string) *cobra.Command {
 	return command
 }
 
+// buildRequestBody turns the --json flag into the value passed to the SDK's
+// Do. Integers must keep their exact value in both shapes: Go's default JSON
+// decoding degrades any integer above 2^53 to a float64, and the query-string
+// path additionally renders large float64s in exponent form.
+//
+// POST/PUT/PATCH send the body verbatim as raw bytes. GET/DELETE/HEAD serialize
+// the payload into the query string, which the SDK builds from a decoded value
+// rather than raw bytes (see databricks-sdk-go/httpclient/request.go,
+// makeRequestBody), so those decode with UseNumber: json.Number keeps the exact
+// digits when makeQueryString formats it with %v.
+func buildRequestBody(method string, payload *flags.JsonFlag) (any, error) {
+	raw := payload.Raw()
+	if raw == nil {
+		return nil, nil
+	}
+	// Reject malformed input client-side with a positioned error (and the @file
+	// source), matching the decoding path this replaced.
+	if err := payload.Validate(); err != nil {
+		return nil, err
+	}
+	switch method {
+	case http.MethodGet, http.MethodDelete, http.MethodHead:
+		var request any
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&request); err != nil {
+			return nil, err
+		}
+		return request, nil
+	default:
+		// A literal `null` body decodes to no body on the SDK side; match that
+		// rather than sending the four bytes "null".
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return nil, nil
+		}
+		return raw, nil
+	}
+}
+
+// renderResponse writes the API response as JSON, preserving it byte-for-byte
+// (integer literals beyond float64 precision and object key order included).
+// raw is already validated JSON or empty: the SDK rejects a non-JSON body
+// before Do returns.
+func renderResponse(ctx context.Context, raw json.RawMessage) error {
+	if len(raw) == 0 {
+		// Empty body (204, HEAD, or an empty 200). Render `null`, as the
+		// decode-into-any path did.
+		return cmdio.Render(ctx, nil)
+	}
+	return cmdio.RenderJSONBytes(ctx, raw)
+}
+
 // normalizeWorkspaceID strips the CLI-only WorkspaceIDNone sentinel so the
 // SDK's idiomatic "if cfg.WorkspaceID != \"\"" check produces the right call
 // shape. The CLI persists "none" in .databrickscfg to mark profiles where the
@@ -128,7 +206,7 @@ func makeCommand(method string) *cobra.Command {
 // this sentinel and would otherwise send the literal "none" as a routing
 // identifier.
 func normalizeWorkspaceID(workspaceID string) string {
-	if workspaceID == auth.WorkspaceIDNone {
+	if workspaceID == profile.WorkspaceIDNone {
 		return ""
 	}
 	return workspaceID
@@ -150,14 +228,19 @@ func hasAccountSegment(rawPath string) (bool, error) {
 	return accountSegmentRe.MatchString(p), nil
 }
 
-// extractOrgIDFromQuery returns the value of the "o" query parameter on path
-// (the SPOG URL convention), or "" if absent or empty.
-func extractOrgIDFromQuery(rawPath string) (string, error) {
+// extractWorkspaceIDFromQuery returns the workspace ID encoded in the path's
+// query string (the SPOG URL convention). It checks "o" first, then "w";
+// returns "" if neither is present or non-empty.
+func extractWorkspaceIDFromQuery(rawPath string) (string, error) {
 	u, err := url.Parse(rawPath)
 	if err != nil {
 		return "", fmt.Errorf("parse path: %w", err)
 	}
-	return u.Query().Get(orgIDQueryParam), nil
+	q := u.Query()
+	if v := q.Get(orgIDQueryParam); v != "" {
+		return v, nil
+	}
+	return q.Get(workspaceIDQueryParam), nil
 }
 
 // resolveOrgID picks the value (if any) for the workspace routing identifier
@@ -182,12 +265,12 @@ func resolveOrgID(
 		}
 		return workspaceIDFlag, nil
 	}
-	orgIDFromQuery, err := extractOrgIDFromQuery(path)
+	workspaceIDFromQuery, err := extractWorkspaceIDFromQuery(path)
 	if err != nil {
 		return "", err
 	}
-	if orgIDFromQuery != "" {
-		return orgIDFromQuery, nil
+	if workspaceIDFromQuery != "" {
+		return workspaceIDFromQuery, nil
 	}
 	isAccount, err := hasAccountSegment(path)
 	if err != nil {

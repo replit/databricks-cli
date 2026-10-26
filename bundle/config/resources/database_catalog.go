@@ -5,14 +5,25 @@ import (
 	"net/url"
 
 	"github.com/databricks/cli/libs/log"
+	"github.com/databricks/cli/libs/workspaceurls"
 
 	"github.com/databricks/databricks-sdk-go"
+	"github.com/databricks/databricks-sdk-go/marshal"
 	"github.com/databricks/databricks-sdk-go/service/database"
 )
 
 type DatabaseCatalog struct {
 	BaseResource
+	ID string `json:"id,omitempty" bundle:"readonly"`
 	database.DatabaseCatalog
+}
+
+func (d *DatabaseCatalog) UnmarshalJSON(b []byte) error {
+	return marshal.Unmarshal(b, d)
+}
+
+func (d DatabaseCatalog) MarshalJSON() ([]byte, error) {
+	return marshal.Marshal(d)
 }
 
 func (d *DatabaseCatalog) Exists(ctx context.Context, w *databricks.WorkspaceClient, name string) (bool, error) {
@@ -37,14 +48,9 @@ func (d *DatabaseCatalog) GetName() string {
 	return d.Name
 }
 
-func (d *DatabaseCatalog) GetURL() string {
-	return d.URL
-}
-
 func (d *DatabaseCatalog) InitializeURL(baseURL url.URL) {
 	if d.Name == "" {
 		return
 	}
-	baseURL.Path = "explore/data/" + d.Name
-	d.URL = baseURL.String()
+	d.URL = workspaceurls.ResourceURL(baseURL, "database_catalogs", d.Name)
 }

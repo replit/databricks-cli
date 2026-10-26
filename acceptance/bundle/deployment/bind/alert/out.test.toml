@@ -1,4 +1,2 @@
-Local = false
 Cloud = true
-CloudEnvs.aws = false
-EnvMatrix.DATABRICKS_BUNDLE_ENGINE = ["terraform", "direct"]
+EnvMatrix.DMS = [""]

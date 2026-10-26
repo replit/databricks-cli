@@ -3,15 +3,22 @@ package phases
 import (
 	"cmp"
 	"context"
+	"math"
+	"reflect"
 	"slices"
+	"strings"
 
 	"github.com/databricks/cli/bundle"
 	"github.com/databricks/cli/bundle/config"
+	"github.com/databricks/cli/bundle/config/engine"
+	"github.com/databricks/cli/bundle/config/resources"
 	"github.com/databricks/cli/bundle/libraries"
+	"github.com/databricks/cli/bundle/metrics"
 	"github.com/databricks/cli/libs/dyn"
 	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/cli/libs/telemetry"
 	"github.com/databricks/cli/libs/telemetry/protos"
+	"github.com/databricks/databricks-sdk-go/service/jobs"
 )
 
 func getExecutionTimes(b *bundle.Bundle) []protos.IntMapEntry {
@@ -33,16 +40,165 @@ func getExecutionTimes(b *bundle.Bundle) []protos.IntMapEntry {
 	return executionTimes
 }
 
-// Maximum length of the error message included in telemetry.
-const maxErrorMessageLength = 500
+// Exclusive upper bounds in bytes for the upload file-size histogram: entry i
+// counts files in [bounds[i-1], bounds[i]). The final bound is math.MaxInt64 so
+// every file maps to a bucket and the last entry is the >= 64 MiB tail.
+//
+// A power-of-2 ladder (each bound is 2x the previous) is used because file sizes
+// span many orders of magnitude; constant-ratio buckets keep useful resolution
+// across the whole range.
+//
+// The histogram is positional on the wire, so changing this list changes the
+// meaning of every entry. Treat the bounds as frozen once the metric has
+// adoption, and keep them in sync with the doc on
+// BundleDeployExperimental.UploadFileSizes.
+var uploadFileSizeBucketBounds = []int64{
+	256,           // 256 B
+	512,           // 512 B
+	1 << 10,       // 1 KiB
+	2 << 10,       // 2 KiB
+	4 << 10,       // 4 KiB
+	8 << 10,       // 8 KiB
+	16 << 10,      // 16 KiB
+	32 << 10,      // 32 KiB
+	64 << 10,      // 64 KiB
+	128 << 10,     // 128 KiB
+	256 << 10,     // 256 KiB
+	512 << 10,     // 512 KiB
+	1 << 20,       // 1 MiB
+	2 << 20,       // 2 MiB
+	4 << 20,       // 4 MiB
+	8 << 20,       // 8 MiB
+	16 << 20,      // 16 MiB
+	32 << 20,      // 32 MiB
+	64 << 20,      // 64 MiB
+	math.MaxInt64, // catch-all upper bound
+}
+
+// uploadFileSizeBucket returns the histogram bucket index for a file of the
+// given size in bytes. Bounds are exclusive upper bounds, so a size that equals
+// a bound belongs in the next bucket.
+func uploadFileSizeBucket(size int64) int {
+	i, found := slices.BinarySearch(uploadFileSizeBucketBounds, size)
+	if found {
+		i++
+	}
+	return i
+}
+
+// sizer is the subset of fileset.File that uploadFileSizeHistogram needs. Taking
+// an interface keeps the histogram unit-testable without constructing real files.
+type sizer interface {
+	Size() (int64, bool)
+}
+
+// uploadFileSizeHistogram counts the uploaded files into uploadFileSizeBucketBounds.
+// If any file's size cannot be determined the whole histogram is omitted (returns
+// nil) rather than emitting a partial, misleading distribution; upload_file_count
+// is reported independently. Also returns nil when no files were uploaded (e.g.
+// source-linked deployments).
+func uploadFileSizeHistogram(files []sizer) []int64 {
+	if len(files) == 0 {
+		return nil
+	}
+	hist := make([]int64, len(uploadFileSizeBucketBounds))
+	for _, f := range files {
+		size, ok := f.Size()
+		if !ok {
+			return nil
+		}
+		hist[uploadFileSizeBucket(size)]++
+	}
+	return hist
+}
+
+// addTaskTypeKeys records a "has_<task_type>" key in out for each task-type field
+// set on the task. A Jobs task carries its type as one of several optional pointer
+// fields (notebook_task, spark_python_task, ai_runtime_task, ...); we reflect over
+// the fields whose JSON name ends in "_task" so every task type is captured,
+// including ones added later, without changing this code.
+func addTaskTypeKeys(task jobs.Task, out map[string]bool) {
+	v := reflect.ValueOf(task)
+	t := v.Type()
+	for i := range t.NumField() {
+		field := v.Field(i)
+		if field.Kind() != reflect.Pointer || field.IsNil() {
+			continue
+		}
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if strings.HasSuffix(name, "_task") {
+			out["has_"+name] = true
+		}
+	}
+}
+
+// collectTaskTypes returns the sorted "has_<task_type>" telemetry keys for every
+// task type used across the bundle's jobs. A for_each_task is unwrapped so the
+// wrapped task's type is recorded too. Sorted for deterministic telemetry output.
+func collectTaskTypes(jobs map[string]*resources.Job) []string {
+	seen := map[string]bool{}
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		for _, task := range job.Tasks {
+			addTaskTypeKeys(task, seen)
+			if task.ForEachTask != nil {
+				addTaskTypeKeys(task.ForEachTask.Task, seen)
+			}
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// aiRuntimeTaskMetrics computes the ai_runtime_task-specific deploy dimensions.
+// present is true when any job declares an ai_runtime_task (including one nested in
+// a for_each_task); scheduled and multitask describe those jobs and are meaningful
+// only when present is true. Task-type presence itself (has_ai_runtime_task and the
+// other has_*_task keys) is recorded generically by collectTaskTypes.
+//
+// code_source_path is deliberately not inspected: it is rewritten to its uploaded
+// remote path before this runs, so it would always read as remote. GPU type and
+// count are likewise not recorded here.
+func aiRuntimeTaskMetrics(jobs map[string]*resources.Job) (present, scheduled, multitask bool) {
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		jobHasAiRuntimeTask := false
+		for _, task := range job.Tasks {
+			rt := task.AiRuntimeTask
+			if rt == nil && task.ForEachTask != nil {
+				rt = task.ForEachTask.Task.AiRuntimeTask
+			}
+			if rt != nil {
+				jobHasAiRuntimeTask = true
+				break
+			}
+		}
+		if !jobHasAiRuntimeTask {
+			continue
+		}
+		present = true
+		if job.Schedule != nil || job.Trigger != nil || job.Continuous != nil {
+			scheduled = true
+		}
+		if len(job.Tasks) > 1 {
+			multitask = true
+		}
+	}
+	return present, scheduled, multitask
+}
 
 // LogDeployTelemetry logs a telemetry event for a bundle deploy command.
 func LogDeployTelemetry(ctx context.Context, b *bundle.Bundle, errMsg string) {
-	errMsg = scrubForTelemetry(errMsg)
-
-	if len(errMsg) > maxErrorMessageLength {
-		errMsg = errMsg[:maxErrorMessageLength]
-	}
+	errMsg = telemetry.ScrubErrorMessage(errMsg)
+	b.Metrics.SetBoolValue(metrics.DeploymentHistoryEnabled, b.DeploymentBundle.StateDB.IsDeploymentMetadataService())
 
 	resourcesCount := int64(0)
 	_, err := dyn.MapByPattern(b.Config.Value(), dyn.NewPattern(dyn.Key("resources"), dyn.AnyKey(), dyn.AnyKey()), func(p dyn.Path, v dyn.Value) (dyn.Value, error) {
@@ -113,6 +269,49 @@ func LogDeployTelemetry(ctx context.Context, b *bundle.Bundle, errMsg string) {
 	slices.Sort(clusterIds)
 	slices.Sort(dashboardIds)
 
+	for _, app := range b.Config.Resources.Apps {
+		if app != nil && app.Lifecycle != nil && app.Lifecycle.Started != nil {
+			b.Metrics.SetBoolValue(metrics.AppLifecycleStarted, *app.Lifecycle.Started)
+			break
+		}
+	}
+
+	for _, cluster := range b.Config.Resources.Clusters {
+		if cluster != nil && cluster.Lifecycle != nil && cluster.Lifecycle.Started != nil {
+			b.Metrics.SetBoolValue(metrics.ClusterLifecycleStarted, *cluster.Lifecycle.Started)
+			break
+		}
+	}
+
+	for _, warehouse := range b.Config.Resources.SqlWarehouses {
+		if warehouse != nil && warehouse.Lifecycle != nil && warehouse.Lifecycle.Started != nil {
+			b.Metrics.SetBoolValue(metrics.SqlWarehouseLifecycleStarted, *warehouse.Lifecycle.Started)
+			break
+		}
+	}
+
+	// Record which task types the bundle uses (has_<task_type> per type present),
+	// plus the ai_runtime_task-specific scheduling / multi-task dimensions.
+	for _, key := range collectTaskTypes(b.Config.Resources.Jobs) {
+		b.Metrics.SetBoolValue(key, true)
+	}
+	if airPresent, airScheduled, airMultitask := aiRuntimeTaskMetrics(b.Config.Resources.Jobs); airPresent {
+		b.Metrics.SetBoolValue(metrics.AiRuntimeTaskScheduled, airScheduled)
+		b.Metrics.SetBoolValue(metrics.AiRuntimeTaskMultitask, airMultitask)
+	}
+
+	// Record whether the removed terraform engine was still requested (the command
+	// then fails with the removal error), separately per source. Only emitted when
+	// true; absence means "not requested via this source". An invalid env value has
+	// already failed the command upstream via ValidateEngineSetting, so treating the
+	// FromEnv error as "not terraform" here cannot mask a real terraform request.
+	if b.Config.Bundle.Engine == engine.EngineTerraform {
+		b.Metrics.SetBoolValue(metrics.EngineTerraformConfig, true)
+	}
+	if envEngine, _ := engine.FromEnv(ctx); envEngine == engine.EngineTerraform {
+		b.Metrics.SetBoolValue(metrics.EngineTerraformEnv, true)
+	}
+
 	// If the bundle UUID is not set, we use a default 0 value.
 	bundleUuid := "00000000-0000-0000-0000-000000000000"
 	if b.Config.Bundle.Uuid != "" {
@@ -155,13 +354,18 @@ func LogDeployTelemetry(ctx context.Context, b *bundle.Bundle, errMsg string) {
 		experimentalConfig = &config.Experimental{}
 	}
 
+	uploadFileSizers := make([]sizer, len(b.Files))
+	for i, f := range b.Files {
+		uploadFileSizers[i] = f
+	}
+
 	telemetry.Log(ctx, protos.DatabricksCliLog{
 		BundleDeployEvent: &protos.BundleDeployEvent{
 			BundleUuid:   bundleUuid,
 			DeploymentId: b.Metrics.DeploymentId.String(),
 			ErrorMessage: errMsg,
 
-			ResourceCount:                     resourcesCount,
+			ResourceCount:                     resourcesCount, //nolint:staticcheck // SA1019: populated alongside ResourcesMetadata during the transition
 			ResourceJobCount:                  int64(len(b.Config.Resources.Jobs)),
 			ResourcePipelineCount:             int64(len(b.Config.Resources.Pipelines)),
 			ResourceModelCount:                int64(len(b.Config.Resources.Models)),
@@ -180,9 +384,13 @@ func LogDeployTelemetry(ctx context.Context, b *bundle.Bundle, errMsg string) {
 			ResourceClusterIDs:   clusterIds,
 			ResourceDashboardIDs: dashboardIds,
 
+			ResourcesMetadata: collectResourcesMetadata(ctx, b),
+
 			Experimental: &protos.BundleDeployExperimental{
 				BundleMode:                   mode,
 				ConfigurationFileCount:       b.Metrics.ConfigurationFileCount,
+				UploadFileCount:              int64(len(b.Files)),
+				UploadFileSizes:              uploadFileSizeHistogram(uploadFileSizers),
 				TargetCount:                  b.Metrics.TargetCount,
 				WorkspaceArtifactPathType:    artifactPathType,
 				BoolValues:                   b.Metrics.BoolValues,

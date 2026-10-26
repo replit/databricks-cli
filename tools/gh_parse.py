@@ -6,9 +6,9 @@
 Analyze downloaded GH logs and print a report. Use gh_report.py instead of this script directly.
 """
 
-import sys
-import json
 import argparse
+import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -38,7 +38,7 @@ KNOWN_SKIP = "🙈\u200bSKIP"
 # The order is important - in case of ambiguity, earlier one gets preference.
 # For examples, each environment gets a summary icon which is earliest action in this list among all tests.
 INTERESTING_ACTIONS = (PANIC, BUG, FAIL, KNOWN_FAILURE, MISSING, FLAKY, RECOVERED, KNOWN_SKIP)
-ACTIONS_WITH_ICON = INTERESTING_ACTIONS + (PASS, SKIP)
+ACTIONS_WITH_ICON = (*INTERESTING_ACTIONS, PASS, SKIP)
 
 # Minimum elapsed time for test to be in slowest tests table.
 SLOWEST_MIN_MINUTES = 2
@@ -91,6 +91,28 @@ class KnownFailuresRule:
             return test_name == self.test_pattern or self._matches_path_prefix(self.test_pattern, test_name)
 
     def _matches_path_prefix(self, s, pattern):
+        """
+        Check if string s matches pattern as a path prefix.
+
+        Matches if pattern is empty (wildcard), s equals pattern exactly,
+        or s starts with pattern followed by a "/".
+
+        >>> rule = KnownFailuresRule("", "", False, False, "")
+        >>> rule._matches_path_prefix("bundle", "")
+        True
+
+        >>> rule._matches_path_prefix("bundle", "bundle")
+        True
+
+        >>> rule._matches_path_prefix("libs/auth", "libs")
+        True
+
+        >>> rule._matches_path_prefix("libsother", "libs")
+        False
+
+        >>> rule._matches_path_prefix("bundle", "bundle/subtest")
+        False
+        """
         if pattern == "":
             return True
         if s == pattern:
@@ -105,7 +127,7 @@ def parse_known_failures(content):
     >>> _test_parse_known_failures()
     """
     rules = []
-    for line_num, line in enumerate(content.splitlines(), 1):
+    for _line_num, line in enumerate(content.splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -131,6 +153,24 @@ def parse_known_failures(content):
 
 
 def _parse_pattern(pattern):
+    """
+    Parse a pattern string, extracting the base and a prefix flag.
+
+    Returns (base, is_prefix) where is_prefix indicates if the pattern
+    ended with "/" (directory prefix match) or was "*" (wildcard).
+
+    >>> _parse_pattern("bundle")
+    ('bundle', False)
+
+    >>> _parse_pattern("*")
+    ('', True)
+
+    >>> _parse_pattern("libs/")
+    ('libs', True)
+
+    >>> _parse_pattern("foo/bar/")
+    ('foo/bar', True)
+    """
     if pattern == "*":
         return "", True
     if pattern.endswith("/"):
@@ -245,11 +285,14 @@ def load_known_failures():
 
 def cleanup_env(name):
     """
-    >>> cleanup_env("test-output-aws-prod-is-linux-ubuntu-latest")
+    >>> cleanup_env("test-output-aws-cli-is-linux-ubuntu-latest")
     'aws linux'
 
-    >>> cleanup_env("test-output-gcp-prod-is-windows-server-latest")
+    >>> cleanup_env("test-output-gcp-cli-is-windows-server-latest")
     'gcp windows'
+
+    >>> cleanup_env("test-output-aws-prod-is-linux-ubuntu-latest")
+    'aws linux'
 
     >>> cleanup_env("test-output-azure-prod-ucws-is-linux-ubuntu-latest")
     'azure-ucws linux'
@@ -259,6 +302,7 @@ def cleanup_env(name):
     name = name.removeprefix("test-output-")
     name = name.replace("-prod-ucws-is-", "-ucws-")
     name = name.replace("-prod-is-", "-")
+    name = name.replace("-cli-is-", "-")
     name = name.replace("-linux-ubuntu-latest", " linux")
     name = name.replace("-windows-server-latest", " windows")
     return name
@@ -269,7 +313,7 @@ def iter_path(filename):
     if p.is_file():
         yield filename
         return
-    for dirpath, dirnames, filenames in p.walk():
+    for dirpath, _dirnames, filenames in p.walk():
         for f in filenames:
             yield dirpath / f
 
@@ -339,7 +383,25 @@ def parse_file(path, filter):
 
 
 def mark_known_failures(results, known_failures_config):
-    """Mark tests as KNOWN_FAILURE or RECOVERED based on known failures config."""
+    """Mark tests as KNOWN_FAILURE or RECOVERED based on known failures config.
+
+    A ``None`` config leaves every result unchanged:
+
+    >>> mark_known_failures({("pkg", "TestA"): FAIL}, None) == {("pkg", "TestA"): FAIL}
+    True
+
+    A matching rule remaps FAIL/PASS/SKIP to their known variants; non-matching
+    tests are left as-is:
+
+    >>> cfg = parse_known_failures("pkg TestA")
+    >>> mark_known_failures({("pkg", "TestA"): FAIL, ("pkg", "TestB"): FAIL}, cfg) == {
+    ...     ("pkg", "TestA"): KNOWN_FAILURE,
+    ...     ("pkg", "TestB"): FAIL,
+    ... }
+    True
+    >>> mark_known_failures({("pkg", "TestA"): PASS}, cfg) == {("pkg", "TestA"): RECOVERED}
+    True
+    """
     marked_results = {}
     for test_key, action in results.items():
         package_name, testname = test_key
@@ -408,7 +470,7 @@ def print_report(filenames, filter, filter_env, show_output, markdown=False, omi
             # incomplete results
             return False
         count = 0
-        for e, env_results in test_results.items():
+        for _e, env_results in test_results.items():
             if PASS in env_results:
                 return False
             if FLAKY in env_results:
@@ -423,7 +485,7 @@ def print_report(filenames, filter, filter_env, show_output, markdown=False, omi
         test_results = per_test_per_env_stats.get(test_key, {})
         if not is_bug(test_results):
             continue
-        for e, env_results in sorted(test_results.items()):
+        for _e, env_results in sorted(test_results.items()):
             if env_results[FAIL] > 0:
                 env_results[FAIL] -= 1
                 if not env_results[FAIL]:
@@ -431,7 +493,7 @@ def print_report(filenames, filter, filter_env, show_output, markdown=False, omi
                 env_results[BUG] += 1
 
     per_env_stats = {}  # env -> action -> count
-    for test_key, items in per_test_per_env_stats.items():
+    for _test_key, items in per_test_per_env_stats.items():
         for env, stats in items.items():
             per_env_stats.setdefault(env, Counter()).update(stats)
 
@@ -527,7 +589,7 @@ def print_report(filenames, filter, filter_env, show_output, markdown=False, omi
                 status, info = action[:2], action[2:]
                 summary[info] = summary.get(info, 0) + 1
                 break
-        items_proc = dict((k, short_action(v)) for (k, v) in items.items())
+        items_proc = {k: short_action(v) for (k, v) in items.items()}
         table.append(
             {
                 " ": status,
@@ -555,7 +617,7 @@ def print_report(filenames, filter, filter_env, show_output, markdown=False, omi
 
     if top_slowest:
         slowest_table = []
-        for env, package_name, testname, duration in top_slowest:
+        for env, _package_name, testname, duration in top_slowest:
             slowest_table.append({"duration": format_duration(duration), "env": env, "testname": testname})
 
         slowest_table_txt = format_table(slowest_table, columns=["duration", "env", "testname"], markdown=markdown)
@@ -588,6 +650,21 @@ def print_report(filenames, filter, filter_env, show_output, markdown=False, omi
 
 
 def make_summary_message(table, summary):
+    """
+    Create a summary message from test results.
+
+    Formats as "N interesting tests: count1 info1, count2 info2, ..."
+    with results sorted by count (highest first).
+
+    >>> make_summary_message([{}, {}, {}], {"failed": 2, "flaky": 1})
+    '3 interesting tests: 2 failed, 1 flaky'
+
+    >>> make_summary_message([{}], {"panic": 5})
+    '1 interesting tests: 5 panic'
+
+    >>> make_summary_message([], {})
+    '0 interesting tests: '
+    """
     items = list(summary.items())
     items.sort(key=lambda x: x[1], reverse=True)
     items = ", ".join(f"{count} {info}" for (info, count) in items)
@@ -597,6 +674,25 @@ def make_summary_message(table, summary):
 # For test table, use shorter version of action.
 # We have full action name in env table, so that is used as agenda.
 def short_action(action):
+    """
+    Return short version of action for table display.
+
+    If the action has a zero-width space at position 1 (emoji format),
+    return first 3 characters (emoji + zero-width space + first letter).
+    Otherwise return the action unchanged.
+
+    >>> short_action("\u274c\\u200bFAIL")
+    '\u274c\\u200bF'
+
+    >>> short_action("\u2705\\u200bpass")
+    '\u2705\\u200bp'
+
+    >>> short_action("regular_text")
+    'regular_text'
+
+    >>> short_action("AB")
+    'AB'
+    """
     if len(action) >= 4 and action[1] == "\u200b":
         # include first non-emoji letter in case emoji rendering is broken
         return action[:3]
@@ -611,6 +707,23 @@ def format_table(table, columns=None, markdown=False):
         table (list[dict]): the data rows
         columns (list[str]): header names & column order
         markdown (bool): whether to output in markdown format
+
+    Columns are padded to a common width (``.splitlines()`` keeps the alignment
+    padding out of this file's own trailing whitespace):
+
+    >>> format_table([{"a": "1", "b": "hello"}], columns=["a", "b"]).splitlines()
+    ['a    b  ', '1  hello']
+
+    >>> print(format_table([{"Env": "aws", "x": "1"}], columns=["Env", "x"], markdown=True))
+    | Env | x |
+    | --- | - |
+    | aws | 1 |
+    <BLANKLINE>
+
+    An empty table yields an empty list rather than a string:
+
+    >>> format_table([])
+    []
     """
     if not table:
         return []
@@ -636,15 +749,17 @@ def format_table(table, columns=None, markdown=False):
 
     if markdown:
         # Header
-        write("| " + " | ".join(autojust(str(col), w) for col, w in zip(columns, widths)) + " |")
+        write("| " + " | ".join(autojust(str(col), w) for col, w in zip(columns, widths, strict=False)) + " |")
         # Separator
         write("| " + " | ".join("-" * w for w in widths) + " |")
         # Data rows
         for row in table:
-            write("| " + " | ".join(autojust(row.get(col, ""), w) for col, w in zip(columns, widths)) + " |")
+            write(
+                "| " + " | ".join(autojust(row.get(col, ""), w) for col, w in zip(columns, widths, strict=False)) + " |"
+            )
     else:
         write(fmt(columns, widths))
-        for ind, row in enumerate(table):
+        for _ind, row in enumerate(table):
             write(fmt([row.get(col, "") for col in columns], widths))
 
     write("")
@@ -653,10 +768,45 @@ def format_table(table, columns=None, markdown=False):
 
 
 def fmt(cells, widths):
-    return "  ".join(autojust(cell, w) for cell, w in zip(cells, widths))
+    """
+    Format cells as a single table row with specified column widths.
+
+    Joins cells with two spaces, applying autojust to each cell.
+
+    >>> fmt(["Name", "123", "Status"], [8, 5, 6])
+    'Name       123   Status'
+
+    >>> fmt(["A", "B"], [3, 3])
+    ' A    B '
+
+    >>> fmt([], [])
+    ''
+    """
+    return "  ".join(autojust(cell, w) for cell, w in zip(cells, widths, strict=False))
 
 
 def autojust(value, width):
+    """
+    Right-align numeric and short values, left-align longer text.
+
+    For terminal display: numeric strings and values with 3 or fewer
+    characters are centered. Longer strings are left-justified.
+
+    >>> autojust("123", 5)
+    ' 123 '
+
+    >>> autojust("test", 6)
+    'test  '
+
+    >>> autojust("AB", 4)
+    ' AB '
+
+    >>> autojust("", 3)
+    '   '
+
+    >>> autojust(0, 3)
+    ' 0 '
+    """
     # Note, this has no effect on how markdown is rendered, only relevant for terminal output
     value = str(value)
     if value.isdigit():
@@ -667,11 +817,39 @@ def autojust(value, width):
 
 
 def wrap_in_details(txt, summary):
+    r"""Wrap ``txt`` in a collapsible GitHub-markdown ``<details>`` block.
+
+    >>> wrap_in_details("BODY", "3 interesting tests")
+    '<details><summary>3 interesting tests</summary>\n\nBODY\n\n</details>'
+    """
     return f"<details><summary>{summary}</summary>\n\n{txt}\n\n</details>"
 
 
 def format_duration(seconds):
-    """Format duration from seconds to MM:SS format."""
+    """
+    Format duration from seconds to MM:SS format.
+
+    Returns empty string for None input. Handles fractional seconds
+    by truncating to integers.
+
+    >>> format_duration(65)
+    '1:05'
+
+    >>> format_duration(3661)
+    '61:01'
+
+    >>> format_duration(0)
+    '0:00'
+
+    >>> format_duration(59)
+    '0:59'
+
+    >>> format_duration(None)
+    ''
+
+    >>> format_duration(3.7)
+    '0:03'
+    """
     if seconds is None:
         return ""
     minutes = int(seconds // 60)

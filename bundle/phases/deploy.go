@@ -3,119 +3,62 @@ package phases
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 
 	"github.com/databricks/cli/bundle"
 	"github.com/databricks/cli/bundle/artifacts"
 	"github.com/databricks/cli/bundle/config"
-	"github.com/databricks/cli/bundle/config/engine"
 	"github.com/databricks/cli/bundle/deploy"
 	"github.com/databricks/cli/bundle/deploy/files"
 	"github.com/databricks/cli/bundle/deploy/lock"
 	"github.com/databricks/cli/bundle/deploy/metadata"
-	"github.com/databricks/cli/bundle/deploy/terraform"
+	"github.com/databricks/cli/bundle/deploy/snapshot"
 	"github.com/databricks/cli/bundle/deployplan"
-	"github.com/databricks/cli/bundle/direct"
 	"github.com/databricks/cli/bundle/libraries"
 	"github.com/databricks/cli/bundle/metrics"
 	"github.com/databricks/cli/bundle/permissions"
 	"github.com/databricks/cli/bundle/scripts"
 	"github.com/databricks/cli/bundle/statemgmt"
+	"github.com/databricks/cli/libs/agent"
 	"github.com/databricks/cli/libs/cmdio"
+	"github.com/databricks/cli/libs/dms"
 	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/cli/libs/logdiag"
 	"github.com/databricks/cli/libs/sync"
+	"github.com/databricks/databricks-sdk-go/service/bundledeployments"
 )
+
+var deployApprovalGroups = []approvalGroup{
+	{group: "schemas", message: deleteOrRecreateSchemaMessage, skipChildren: true},
+	{group: "pipelines", message: deleteOrRecreatePipelineMessage},
+	{group: "volumes", message: deleteOrRecreateVolumeMessage},
+	{group: "dashboards", message: deleteOrRecreateDashboardMessage},
+	{group: "database_instances", message: deleteOrRecreateDatabaseInstanceMessage},
+	{group: "synced_database_tables", message: deleteOrRecreateSyncedDatabaseTableMessage},
+	{group: "postgres_projects", message: deleteOrRecreatePostgresProjectMessage},
+	{group: "postgres_branches", message: deleteOrRecreatePostgresBranchMessage},
+	{group: "postgres_databases", message: deleteOrRecreatePostgresDatabaseMessage},
+	{group: "vector_search_indexes", message: deleteOrRecreateVectorSearchIndexMessage},
+	{group: "genie_spaces", message: deleteOrRecreateGenieSpaceMessage},
+}
 
 func approvalForDeploy(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan) (bool, error) {
 	actions := plan.GetActions()
+
+	// Deletes that only clean up the state (already gone remotely, or no delete
+	// operation) are not destructive and need no approval.
+	actions = slices.DeleteFunc(actions, func(a deployplan.Action) bool { return a.IsStateOnlyDelete() })
 
 	err := checkForPreventDestroy(b, actions)
 	if err != nil {
 		return false, err
 	}
 
-	types := []deployplan.ActionType{deployplan.Recreate, deployplan.Delete}
-	schemaActions := filterGroup(actions, "schemas", types...)
-	pipelineActions := filterGroup(actions, "pipelines", types...)
-	volumeActions := filterGroup(actions, "volumes", types...)
-	dashboardActions := filterGroup(actions, "dashboards", types...)
-	databaseInstanceActions := filterGroup(actions, "database_instances", types...)
-	syncedDatabaseTableActions := filterGroup(actions, "synced_database_tables", types...)
-	postgresProjectActions := filterGroup(actions, "postgres_projects", types...)
-	postgresBranchActions := filterGroup(actions, "postgres_branches", types...)
-
-	// We don't need to display any prompts in this case.
-	if len(schemaActions) == 0 && len(pipelineActions) == 0 && len(volumeActions) == 0 && len(dashboardActions) == 0 &&
-		len(databaseInstanceActions) == 0 && len(syncedDatabaseTableActions) == 0 &&
-		len(postgresProjectActions) == 0 && len(postgresBranchActions) == 0 {
+	total := logApprovalGroups(ctx, actions, deployApprovalGroups, false, deployplan.Recreate, deployplan.Delete)
+	if total == 0 {
+		// No destructive actions in any tracked group: skip the prompt.
 		return true, nil
-	}
-
-	// One or more UC schema resources will be deleted or recreated.
-	if len(schemaActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreateSchemaMessage)
-		for _, action := range schemaActions {
-			if action.IsChildResource() {
-				continue
-			}
-			cmdio.Log(ctx, action)
-		}
-	}
-
-	// One or more pipelines is being recreated.
-	if len(pipelineActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreatePipelineMessage)
-		for _, action := range pipelineActions {
-			cmdio.Log(ctx, action)
-		}
-	}
-
-	// One or more volumes is being recreated.
-	if len(volumeActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreateVolumeMessage)
-		for _, action := range volumeActions {
-			cmdio.Log(ctx, action)
-		}
-	}
-
-	// One or more dashboards is being recreated.
-	if len(dashboardActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreateDashboardMessage)
-		for _, action := range dashboardActions {
-			cmdio.Log(ctx, action)
-		}
-	}
-
-	// One or more database instances is being deleted or recreated.
-	if len(databaseInstanceActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreateDatabaseInstanceMessage)
-		for _, action := range databaseInstanceActions {
-			cmdio.Log(ctx, action)
-		}
-	}
-
-	// One or more synced database tables is being deleted or recreated.
-	if len(syncedDatabaseTableActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreateSyncedDatabaseTableMessage)
-		for _, action := range syncedDatabaseTableActions {
-			cmdio.Log(ctx, action)
-		}
-	}
-
-	// One or more Lakebase projects is being deleted or recreated.
-	if len(postgresProjectActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreatePostgresProjectMessage)
-		for _, action := range postgresProjectActions {
-			cmdio.Log(ctx, action)
-		}
-	}
-
-	// One or more Lakebase branches is being deleted or recreated.
-	if len(postgresBranchActions) != 0 {
-		cmdio.LogString(ctx, deleteOrRecreatePostgresBranchMessage)
-		for _, action := range postgresBranchActions {
-			cmdio.Log(ctx, action)
-		}
 	}
 
 	if b.AutoApprove {
@@ -123,59 +66,86 @@ func approvalForDeploy(ctx context.Context, b *bundle.Bundle, plan *deployplan.P
 	}
 
 	if !cmdio.IsPromptSupported(ctx) {
-		return false, errors.New("the deployment requires destructive actions, but current console does not support prompting. Please specify --auto-approve if you would like to skip prompts and proceed")
+		return false, errors.New("the deployment requires destructive actions, but the current console does not support prompting.\n" +
+			DataLossWarning + "\n" +
+			"To proceed, use --auto-approve after reviewing the plan above." + agent.AgentNotice())
 	}
 
 	cmdio.LogString(ctx, "")
-	approved, err := cmdio.AskYesOrNo(ctx, "Would you like to proceed?")
-	if err != nil {
-		return false, err
-	}
-
-	return approved, nil
+	return cmdio.AskYesOrNo(ctx, "Would you like to proceed?")
 }
 
-func deployCore(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan, targetEngine engine.EngineType) {
-	// Core mutators that CRUD resources and modify deployment state. These
-	// mutators need informed consent if they are potentially destructive.
-	cmdio.LogString(ctx, "Deploying resources...")
-
-	if targetEngine.IsDirect() {
-		b.DeploymentBundle.Apply(ctx, b.WorkspaceClient(ctx), plan, direct.MigrateMode(false))
-		// Finalize state: write to disk even if deploy failed, so partial progress is saved.
-		// Skip for empty plans to avoid creating a state file when nothing was deployed.
-		if len(plan.Plan) > 0 {
-			if err := b.DeploymentBundle.StateDB.Finalize(); err != nil {
-				logdiag.LogError(ctx, err)
-			}
-		}
-	} else {
-		bundle.ApplyContext(ctx, b, terraform.Apply())
+func deployCore(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan) {
+	// Apply resources and capture post-apply state. Finalize flushes the WAL to disk and
+	// returns the state; called even if Apply failed so partial progress is saved.
+	b.DeploymentBundle.Apply(ctx, b.WorkspaceClient(ctx), plan, reportPerResource(b))
+	state, err := b.DeploymentBundle.StateDB.Finalize(ctx)
+	// Capture the finalized state for deploy telemetry. It carries each
+	// resource's state-size in bytes (from the WAL replay Finalize just
+	// did), so telemetry needs no extra read or parse of the state file.
+	b.Metrics.ResourceState = state
+	if err != nil {
+		logdiag.LogError(ctx, err)
 	}
 
 	// Even if deployment failed, there might be updates in states that we need to upload
-	statemgmt.PushResourcesState(ctx, b, targetEngine)
+	statemgmt.PushResourcesState(ctx, b)
 	if logdiag.HasError(ctx) {
 		return
 	}
 
-	bundle.ApplySeqContext(ctx, b,
-		statemgmt.Load(targetEngine),
+	bundle.ApplySeqContext(
+		ctx, b,
+		statemgmt.Load(state),
 		metadata.Compute(),
 		metadata.Upload(),
-		statemgmt.UploadStateForYamlSync(targetEngine),
 	)
+}
 
-	if !logdiag.HasError(ctx) {
-		cmdio.LogString(ctx, "Deployment complete!")
+// reportPerResource reports whether the deploy should list resources individually
+// (-q and -qq drop those lines).
+func reportPerResource(b *bundle.Bundle) bool {
+	return b.Quiet < bundle.QuietSummary
+}
+
+// logFileSummary reports what the file sync did. Separate from the resource summary
+// because a deploy that only changes business logic (a .py or .sql file) leaves every
+// resource unchanged, so without this line its summary is all zeros and looks like a
+// no-op. Called on the failure paths too: the files were uploaded before whatever
+// failed afterwards, so the count is accurate even then.
+func logFileSummary(ctx context.Context, b *bundle.Bundle) {
+	if b.Quiet >= bundle.QuietAll {
+		return
 	}
+	cmdio.LogString(ctx, fmt.Sprintf("Files: %d uploaded, %d deleted", b.FileCounts.Uploaded, b.FileCounts.Deleted))
+}
+
+// logDeploySummary prints the resource summary line. -qq drops it too. The direct engine
+// prints each per-resource applied line itself as it goes, so there are none to report here.
+func logDeploySummary(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan) {
+	if b.Quiet >= bundle.QuietAll {
+		return
+	}
+
+	logFileSummary(ctx, b)
+
+	counts := plan.CountActions()
+	summary := fmt.Sprintf("Resources: %d created, %d changed, %d deleted, %d unchanged", counts.Create, counts.Change, counts.Delete, counts.Unchanged)
+	// Gate on the plan's own NotSelected (not b.Select) so the suffix survives a
+	// deploy from a --plan file, where --select was applied at plan time and
+	// b.Select is empty here. NotSelected is only ever set by FilterToSelected.
+	if plan.NotSelected > 0 {
+		summary += fmt.Sprintf(", %d not selected", plan.NotSelected)
+	}
+	cmdio.LogString(ctx, summary)
 }
 
 // uploadLibraries uploads libraries to the workspace.
 // It also cleans up the artifacts directory and transforms wheel tasks.
 // It is called by only "bundle deploy".
 func uploadLibraries(ctx context.Context, b *bundle.Bundle, libs map[string][]libraries.LocationToUpdate) {
-	bundle.ApplySeqContext(ctx, b,
+	bundle.ApplySeqContext(
+		ctx, b,
 		artifacts.CleanUp(),
 		libraries.Upload(libs),
 	)
@@ -183,33 +153,76 @@ func uploadLibraries(ctx context.Context, b *bundle.Bundle, libs map[string][]li
 
 // The deploy phase deploys artifacts and resources.
 // If readPlanPath is provided, the plan is loaded from that file instead of being calculated.
-func Deploy(ctx context.Context, b *bundle.Bundle, outputHandler sync.OutputHandler, engine engine.EngineType, libs map[string][]libraries.LocationToUpdate, plan *deployplan.Plan) {
+func Deploy(ctx context.Context, b *bundle.Bundle, outputHandler sync.OutputHandler, libs map[string][]libraries.LocationToUpdate, plan *deployplan.Plan, dmsDeployment *bundledeployments.Deployment) {
 	log.Info(ctx, "Phase: deploy")
 
 	// Core mutators that CRUD resources and modify deployment state. These
-	// mutators need informed consent if they are potentially destructive.
-	bundle.ApplySeqContext(ctx, b,
-		scripts.Execute(config.ScriptPreDeploy),
-		lock.Acquire(),
-	)
-
+	// mutators need informed consent if they are potentially destructive. The
+	// predeploy script ran in ProcessBundleRet, ahead of this phase.
+	bundle.ApplyContext(ctx, b, lock.Acquire(lock.GoalDeploy))
 	if logdiag.HasError(ctx) {
 		// lock is not acquired here
 		return
 	}
 
 	// lock is acquired here
+	//
+	// The version is created only after approval; CompleteVersion is deferred before
+	// lock.Release and no-ops until then.
 	defer func() {
+		if b.DeploymentBundle.StateDB.IsDeploymentMetadataService() {
+			if _, err := b.DeploymentBundle.StateDB.CompleteVersion(ctx, !logdiag.HasError(ctx)); err != nil {
+				logdiag.LogError(ctx, err)
+			}
+		}
 		bundle.ApplyContext(ctx, b, lock.Release(lock.GoalDeploy))
 	}()
 
-	uploadLibraries(ctx, b, libs)
-	if logdiag.HasError(ctx) {
-		return
+	immutable := b.IsImmutableFolder()
+
+	if !immutable {
+		if plan != nil {
+			// Applying a saved plan: upload the local artifact files the plan was
+			// computed against. LocalLibraryPaths expands any library globs that
+			// haven't been processed yet and computes patched paths for
+			// dynamic_version wheels from the cache left by "bundle plan".
+			planLocalPaths, err := libraries.LocalLibraryPaths(ctx, b)
+			if err != nil {
+				logdiag.LogError(ctx, err)
+				return
+			}
+			planLibs := make(map[string][]libraries.LocationToUpdate, len(planLocalPaths))
+			for _, p := range planLocalPaths {
+				planLibs[p] = nil
+			}
+			uploadLibraries(ctx, b, planLibs)
+		} else {
+			uploadLibraries(ctx, b, libs)
+		}
+		if logdiag.HasError(ctx) {
+			return
+		}
+
+		bundle.ApplySeqContext(ctx, b, files.Upload(outputHandler))
+		if logdiag.HasError(ctx) {
+			return
+		}
 	}
 
-	bundle.ApplySeqContext(ctx, b,
-		files.Upload(outputHandler),
+	// From here on the files are uploaded, so report them however the rest of the
+	// deploy turns out. Deferred rather than repeated at each of the returns below, so
+	// that a new early return cannot silently drop it. On success logDeploySummary
+	// prints this line itself, between the per-resource lines and the resource summary,
+	// and sets the flag so the defer does not print it twice.
+	filesReported := false
+	defer func() {
+		if !filesReported {
+			logFileSummary(ctx, b)
+		}
+	}()
+
+	bundle.ApplySeqContext(
+		ctx, b,
 		deploy.StateUpdate(),
 		deploy.StatePush(),
 		permissions.ApplyWorkspaceRootPermissions(),
@@ -221,83 +234,149 @@ func Deploy(ctx context.Context, b *bundle.Bundle, outputHandler sync.OutputHand
 		return
 	}
 
-	if plan != nil {
+	if immutable {
+		// Only discard previously staged zips when building a fresh plan. When applying
+		// a pre-existing plan (plan != nil), its zip_path points at a file staged when
+		// the plan was produced, so leave the snapshots folder intact.
+		bundle.ApplyContext(ctx, b, snapshot.PlanUpload(snapshot.PlanUploadOptions{Clean: plan == nil}))
+		if logdiag.HasError(ctx) {
+			return
+		}
+	}
+
+	planFromFile := plan != nil
+
+	if plan == nil {
+		// State is already open for read by process.go (or by Migrate)
+		plan = RunPlan(ctx, b)
+	}
+
+	// Stop before opening the WAL for write if planning failed. UpgradeToWrite
+	// writes a WAL header that only deployCore's Finalize commits or discards;
+	// returning past it without finalizing leaves a header-only WAL behind.
+	if logdiag.HasError(ctx) {
+		return
+	}
+
+	haveApproval, err := approvalForDeploy(ctx, b, plan)
+	if !haveApproval {
+		// No version was created, so the deferred CompleteVersion is a no-op and the version
+		// number is left for the next deploy. Both the user declining and a console that
+		// cannot prompt land here.
+		//
+		// A prepared terraform→direct migration lives only in memory (Migrate wrote nothing
+		// durable and CommitMigration below never ran), so a declined deploy just drops it and
+		// leaves the terraform state on disk untouched - nothing changes, and the next deploy
+		// migrates again.
+		if b.MigratingToDirect {
+			log.Warnf(ctx, "Migration not committed, keeping Terraform state")
+		}
+		if err != nil {
+			logdiag.LogError(ctx, err)
+			return
+		}
+		cmdio.LogString(ctx, "Deployment cancelled!")
+		return
+	}
+
+	// Approved. Commit a prepared terraform→direct migration now, before the deploy applies
+	// anything: this is the migration's point of no return - it pushes the converted state at
+	// serial tf+1 and retires the terraform state, so from here the bundle is on direct. The
+	// deploy below then advances the state to tf+2. Committing here rather than after the deploy
+	// keeps the model clean (once approved, we are on direct) at the cost of one window: a deploy
+	// that then fails has still migrated. A failed migration errored out before this point (the
+	// terraform engine is gone, so there is nothing to fall back to), so reaching here with
+	// MigratingToDirect set means the in-memory migration is ready to commit.
+	if b.MigratingToDirect {
+		statemgmt.CommitMigration(ctx, b)
+		if logdiag.HasError(ctx) {
+			return
+		}
+	}
+
+	// Upgrade from read (opened by process.go, or by Migrate) to write mode. After approval
+	// and the migration commit above, so a declined deploy never opens a WAL it must discard,
+	// and the migration's tf+1 push lands before this advances the WAL header to tf+2.
+	if err := b.DeploymentBundle.StateDB.UpgradeToWrite(); err != nil {
+		logdiag.LogError(ctx, err)
+		return
+	}
+
+	if planFromFile {
 		// Initialize DeploymentBundle for applying the loaded plan
 		err := b.DeploymentBundle.InitForApply(ctx, b.WorkspaceClient(ctx), plan)
 		if err != nil {
 			logdiag.LogError(ctx, err)
 			return
 		}
-	} else {
-		plan = RunPlan(ctx, b, engine)
 	}
+
+	// InitForApply receives ctx and could log a diagnostic without returning an error, so
+	// re-check before deploying.
+	if logdiag.HasError(ctx) {
+		return
+	}
+
+	// Create the deployment now that the plan is approved, so a declined deploy leaves none behind.
+	// A first deploy's id did not exist at plan time - the version and any existing id were stamped
+	// then - so stamp the one just created into the plan the apply reads.
+	if b.DeploymentBundle.StateDB.IsDeploymentMetadataService() {
+		firstDeploy := b.DeploymentBundle.StateDB.DeploymentID == ""
+		createOrUpdateDeployment(ctx, b, dmsDeployment)
+		if logdiag.HasError(ctx) {
+			return
+		}
+		if firstDeploy {
+			if err := b.DeploymentBundle.StampDeploymentIdForFirstVersion(b.DeploymentBundle.StateDB.DeploymentID); err != nil {
+				logdiag.LogError(ctx, err)
+				return
+			}
+		}
+
+		// Only create a version when the plan has at least one operation to record, so it moves
+		// with serial. Done after the prompt, so a declined deploy never claims a number.
+		staged, err := stagedOperations(plan)
+		if err != nil {
+			logdiag.LogError(ctx, err)
+			return
+		}
+		if len(staged) > 0 {
+			if err := startVersion(ctx, b, dms.VersionTypeDeploy, staged); err != nil {
+				logdiag.LogError(ctx, err)
+				return
+			}
+			logDeploymentVersion(ctx, b)
+		}
+	}
+
+	deployCore(ctx, b, plan)
 
 	if logdiag.HasError(ctx) {
 		return
 	}
 
-	haveApproval, err := approvalForDeploy(ctx, b, plan)
-	if err != nil {
-		logdiag.LogError(ctx, err)
-		return
-	}
-	if haveApproval {
-		deployCore(ctx, b, plan, engine)
-	} else {
-		cmdio.LogString(ctx, "Deployment cancelled!")
-		return
-	}
-
-	if logdiag.HasError(ctx) {
-		return
-	}
+	// Report what was deployed, mirroring "bundle plan". Printed before the
+	// postdeploy script so the deploy's own report is not interleaved with
+	// post-deploy output: the script's lines and the migration's below both follow
+	// it, and neither reads as belonging to the deploy. The resources were applied
+	// above, so the counts are accurate however the script turns out, and its error
+	// still propagates. Earlier failures report the files only, since the plan
+	// counts would then describe what was intended rather than what was applied.
+	filesReported = true
+	logDeploySummary(ctx, b, plan)
 
 	bundle.ApplyContext(ctx, b, scripts.Execute(config.ScriptPostDeploy))
 }
 
-func RunPlan(ctx context.Context, b *bundle.Bundle, engine engine.EngineType) *deployplan.Plan {
-	if engine.IsDirect() {
-		plan, err := b.DeploymentBundle.CalculatePlan(ctx, b.WorkspaceClient(ctx), &b.Config)
-		if err != nil {
-			logdiag.LogError(ctx, err)
-			return nil
-		}
-		return plan
-	}
-
-	bundle.ApplySeqContext(ctx, b,
-		terraform.Interpolate(),
-		terraform.Write(),
-		terraform.Plan(terraform.PlanGoal("deploy")),
-	)
-
-	if logdiag.HasError(ctx) {
-		return nil
-	}
-
-	tf := b.Terraform
-	if tf == nil {
-		logdiag.LogError(ctx, errors.New("terraform not initialized"))
-		return nil
-	}
-
-	plan, err := terraform.ShowPlanFile(ctx, tf, b.TerraformPlanPath)
+func RunPlan(ctx context.Context, b *bundle.Bundle) *deployplan.Plan {
+	plan, err := b.DeploymentBundle.CalculatePlan(ctx, b.WorkspaceClient(ctx), &b.Config)
 	if err != nil {
 		logdiag.LogError(ctx, err)
 		return nil
 	}
-
-	for _, group := range b.Config.Resources.AllResources() {
-		for rKey := range group.Resources {
-			resourceKey := "resources." + group.Description.PluralName + "." + rKey
-			if _, ok := plan.Plan[resourceKey]; !ok {
-				plan.Plan[resourceKey] = &deployplan.PlanEntry{
-					Action: deployplan.Skip,
-				}
-			}
-		}
+	if len(b.Select) > 0 {
+		plan.FilterToSelected(b.Select)
 	}
-
 	return plan
 }
 

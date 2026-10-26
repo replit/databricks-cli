@@ -9,14 +9,14 @@ If you already have dbt installed, just type 'cd my_dbt_sql; dbt init' to get st
 Refer to the README.md file for full "getting started" guide and production setup instructions.
 
 
->>> cat out.requests.txt
+>>> cat [OUTPUT_DIR]/out.requests.txt
 {
   "frontend_log_event_id": "[UUID]",
   "entry": {
     "databricks_cli_log": {
       "execution_context": {
         "cmd_exec_id": "[CMD-EXEC-ID]",
-        "version": "[DEV_VERSION]",
+        "version": "[CLI_VERSION]",
         "command": "bundle_init",
         "operating_system": "[OS]",
         "execution_time_ms": SMALL_INT,

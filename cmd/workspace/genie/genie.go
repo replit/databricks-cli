@@ -3,6 +3,7 @@
 package genie
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -31,15 +32,21 @@ func New() *cobra.Command {
 		RunE:    root.ReportUnknownSubcommand,
 	}
 
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
 	// Add methods
 	cmd.AddCommand(newCreateMessage())
 	cmd.AddCommand(newCreateMessageComment())
 	cmd.AddCommand(newCreateSpace())
 	cmd.AddCommand(newDeleteConversation())
 	cmd.AddCommand(newDeleteConversationMessage())
+	cmd.AddCommand(newDownloadMessageAttachmentVisualization())
 	cmd.AddCommand(newExecuteMessageAttachmentQuery())
 	cmd.AddCommand(newExecuteMessageQuery())
 	cmd.AddCommand(newGenerateDownloadFullQueryResult())
+	cmd.AddCommand(newGenieCancelResponse())
 	cmd.AddCommand(newGenieCreateEvalRun())
 	cmd.AddCommand(newGenieGetEvalResultDetails())
 	cmd.AddCommand(newGenieGetEvalRun())
@@ -92,13 +99,15 @@ func newCreateMessage() *cobra.Command {
 
 	cmd.Flags().Var(&createMessageJson, "json", `either inline JSON string or @path/to/file.json with request body`)
 
-	cmd.Use = "create-message SPACE_ID CONVERSATION_ID CONTENT"
-	cmd.Short = `Create conversation message.`
-	cmd.Long = `Create conversation message.
+	cmd.Flags().BoolVar(&createMessageReq.EnableVisualization, "enable-visualization", createMessageReq.EnableVisualization, `Enable visualization generation.`)
 
-  Create new message in a [conversation](:method:genie/startconversation). The
-  AI response uses all previously created messages in the conversation to
-  respond.
+	cmd.Use = "create-message SPACE_ID CONVERSATION_ID CONTENT"
+	cmd.Short = `Chat mode: Send a message.`
+	cmd.Long = `Chat mode: Send a message.
+
+  Sends a new message in a chat-mode
+  [conversation](:method:genie/startconversation). The AI response uses all
+  previously created messages in the conversation to respond.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where the conversation is started.
@@ -106,12 +115,14 @@ func newCreateMessage() *cobra.Command {
     CONTENT: User message content.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(2)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only SPACE_ID, CONVERSATION_ID as positional arguments. Provide 'content' in your JSON input")
+				return errors.New("when --json flag is specified, provide only SPACE_ID, CONVERSATION_ID as positional arguments. Provide 'content' in your JSON input")
 			}
 			return nil
 		}
@@ -192,8 +203,10 @@ func newCreateMessageComment() *cobra.Command {
 	cmd.Flags().Var(&createMessageCommentJson, "json", `either inline JSON string or @path/to/file.json with request body`)
 
 	cmd.Use = "create-message-comment SPACE_ID CONVERSATION_ID MESSAGE_ID CONTENT"
-	cmd.Short = `Create message comment.`
-	cmd.Long = `Create message comment.
+	cmd.Short = `*Public Preview* Add a comment to a message.`
+	cmd.Long = `This command is in Public Preview and may change without notice.
+
+Add a comment to a message.
 
   Create a comment on a conversation message.
 
@@ -204,12 +217,14 @@ func newCreateMessageComment() *cobra.Command {
     CONTENT: Comment text content.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_PREVIEW"
+	cmd.Annotations["launch_stage_display"] = "Public Preview"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(3)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only SPACE_ID, CONVERSATION_ID, MESSAGE_ID as positional arguments. Provide 'content' in your JSON input")
+				return errors.New("when --json flag is specified, provide only SPACE_ID, CONVERSATION_ID, MESSAGE_ID as positional arguments. Provide 'content' in your JSON input")
 			}
 			return nil
 		}
@@ -283,8 +298,8 @@ func newCreateSpace() *cobra.Command {
 	cmd.Flags().StringVar(&createSpaceReq.Title, "title", createSpaceReq.Title, `Optional title override.`)
 
 	cmd.Use = "create-space WAREHOUSE_ID SERIALIZED_SPACE"
-	cmd.Short = `Create Genie Space.`
-	cmd.Long = `Create Genie Space.
+	cmd.Short = `Create a Genie space.`
+	cmd.Long = `Create a Genie space.
 
   Creates a Genie space from a serialized payload.
 
@@ -297,12 +312,14 @@ func newCreateSpace() *cobra.Command {
       components.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(0)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, no positional arguments are allowed. Provide 'warehouse_id', 'serialized_space' in your JSON input")
+				return errors.New("when --json flag is specified, no positional arguments are allowed. Provide 'warehouse_id', 'serialized_space' in your JSON input")
 			}
 			return nil
 		}
@@ -369,16 +386,16 @@ func newDeleteConversation() *cobra.Command {
 	var deleteConversationReq dashboards.GenieDeleteConversationRequest
 
 	cmd.Use = "delete-conversation SPACE_ID CONVERSATION_ID"
-	cmd.Short = `Delete conversation.`
-	cmd.Long = `Delete conversation.
-
-  Delete a conversation.
+	cmd.Short = `Delete a conversation.`
+	cmd.Long = `Delete a conversation.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where the conversation is located.
     CONVERSATION_ID: The ID of the conversation to delete.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -427,10 +444,8 @@ func newDeleteConversationMessage() *cobra.Command {
 	var deleteConversationMessageReq dashboards.GenieDeleteConversationMessageRequest
 
 	cmd.Use = "delete-conversation-message SPACE_ID CONVERSATION_ID MESSAGE_ID"
-	cmd.Short = `Delete conversation message.`
-	cmd.Long = `Delete conversation message.
-
-  Delete a conversation message.
+	cmd.Short = `Delete a conversation message.`
+	cmd.Long = `Delete a conversation message.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where the message is located.
@@ -438,6 +453,8 @@ func newDeleteConversationMessage() *cobra.Command {
     MESSAGE_ID: The ID associated with the message to delete.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -472,6 +489,69 @@ func newDeleteConversationMessage() *cobra.Command {
 	return cmd
 }
 
+// start download-message-attachment-visualization command
+
+// Slice with functions to override default command behavior.
+// Functions can be added from the `init()` function in manually curated files in this directory.
+var downloadMessageAttachmentVisualizationOverrides []func(
+	*cobra.Command,
+	*dashboards.DownloadMessageAttachmentVisualizationRequest,
+)
+
+func newDownloadMessageAttachmentVisualization() *cobra.Command {
+	cmd := &cobra.Command{}
+
+	var downloadMessageAttachmentVisualizationReq dashboards.DownloadMessageAttachmentVisualizationRequest
+
+	cmd.Use = "download-message-attachment-visualization NAME"
+	cmd.Short = `Download an attachment visualization.`
+	cmd.Long = `Download an attachment visualization.
+
+  Download a rendered image of a message visualization attachment. The response
+  body is the raw PNG image, not a JSON payload. This is only available if the
+  attachment is a visualization and the message status is COMPLETED.
+
+  Arguments:
+    NAME: The resource name of the attachment to render, in the format
+      spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}.`
+
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		check := root.ExactArgs(1)
+		return check(cmd, args)
+	}
+
+	cmd.PreRunE = root.MustWorkspaceClient
+	cmd.RunE = func(cmd *cobra.Command, args []string) (err error) {
+		ctx := cmd.Context()
+		w := cmdctx.WorkspaceClient(ctx)
+
+		downloadMessageAttachmentVisualizationReq.Name = args[0]
+
+		response, err := w.Genie.DownloadMessageAttachmentVisualization(ctx, downloadMessageAttachmentVisualizationReq)
+		if err != nil {
+			return err
+		}
+
+		defer response.Contents.Close()
+		return cmdio.Render(ctx, response.Contents)
+	}
+
+	// Disable completions since they are not applicable.
+	// Can be overridden by manual implementation in `override.go`.
+	cmd.ValidArgsFunction = cobra.NoFileCompletions
+
+	// Apply optional overrides to this command.
+	for _, fn := range downloadMessageAttachmentVisualizationOverrides {
+		fn(cmd, &downloadMessageAttachmentVisualizationReq)
+	}
+
+	return cmd
+}
+
 // start execute-message-attachment-query command
 
 // Slice with functions to override default command behavior.
@@ -487,8 +567,8 @@ func newExecuteMessageAttachmentQuery() *cobra.Command {
 	var executeMessageAttachmentQueryReq dashboards.GenieExecuteMessageAttachmentQueryRequest
 
 	cmd.Use = "execute-message-attachment-query SPACE_ID CONVERSATION_ID MESSAGE_ID ATTACHMENT_ID"
-	cmd.Short = `Execute message attachment SQL query.`
-	cmd.Long = `Execute message attachment SQL query.
+	cmd.Short = `Execute an attachment SQL query.`
+	cmd.Long = `Execute an attachment SQL query.
 
   Execute the SQL for a message query attachment. Use this API when the query
   attachment has expired and needs to be re-executed.
@@ -500,6 +580,8 @@ func newExecuteMessageAttachmentQuery() *cobra.Command {
     ATTACHMENT_ID: Attachment ID`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(4)
@@ -566,6 +648,8 @@ func newExecuteMessageQuery() *cobra.Command {
 	cmd.Hidden = true
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PRIVATE_PREVIEW"
+	cmd.Annotations["launch_stage_display"] = "Private Preview"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -616,8 +700,8 @@ func newGenerateDownloadFullQueryResult() *cobra.Command {
 	var generateDownloadFullQueryResultReq dashboards.GenieGenerateDownloadFullQueryResultRequest
 
 	cmd.Use = "generate-download-full-query-result SPACE_ID CONVERSATION_ID MESSAGE_ID ATTACHMENT_ID"
-	cmd.Short = `Generate full query result download.`
-	cmd.Long = `Generate full query result download.
+	cmd.Short = `Start a full query-result download.`
+	cmd.Long = `Start a full query-result download.
 
   Initiates a new SQL execution and returns a download_id and
   download_id_signature that you can use to track the progress of the
@@ -631,12 +715,10 @@ func newGenerateDownloadFullQueryResult() *cobra.Command {
   ### **Warning: Databricks strongly recommends that you protect the URLs that
   are returned by the EXTERNAL_LINKS disposition.**
 
-  When you use the EXTERNAL_LINKS disposition, a short-lived, URL is
-  generated, which can be used to download the results directly from . As a
-  short-lived is embedded in this URL, you should protect the URL.
-
-  Because URLs are already generated with embedded temporary s, you must not set
-  an Authorization header in the download requests.
+  When you use the EXTERNAL_LINKS disposition, a short-lived cloud-storage URL
+  is generated to download the results. The URL contains temporary access
+  credentials, so protect it and do not set an Authorization header in the
+  download request.
 
   See [Execute Statement](:method:statementexecution/executestatement) for more
   details.
@@ -650,6 +732,8 @@ func newGenerateDownloadFullQueryResult() *cobra.Command {
     ATTACHMENT_ID: Attachment ID`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(4)
@@ -686,6 +770,72 @@ func newGenerateDownloadFullQueryResult() *cobra.Command {
 	return cmd
 }
 
+// start genie-cancel-response command
+
+// Slice with functions to override default command behavior.
+// Functions can be added from the `init()` function in manually curated files in this directory.
+var genieCancelResponseOverrides []func(
+	*cobra.Command,
+	*dashboards.GenieCancelResponseRequest,
+)
+
+func newGenieCancelResponse() *cobra.Command {
+	cmd := &cobra.Command{}
+
+	var genieCancelResponseReq dashboards.GenieCancelResponseRequest
+
+	cmd.Use = "genie-cancel-response AGENT_ID CONVERSATION_ID RESPONSE_ID"
+	cmd.Short = `Agent mode: Cancel a response.`
+	cmd.Long = `Agent mode: Cancel a response.
+
+  Cancels an in-flight agent-mode response. response_id is the id returned in
+  the response.created event from the agent-mode responses endpoint. The
+  response stops at the next agent boundary and its terminal state is returned.
+
+  Arguments:
+    AGENT_ID: The ID of the Genie agent (synonymous with the Genie space ID).
+    CONVERSATION_ID: The ID of the conversation containing the response.
+    RESPONSE_ID: The ID of the response to cancel (the id from the response.created
+      event).`
+
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		check := root.ExactArgs(3)
+		return check(cmd, args)
+	}
+
+	cmd.PreRunE = root.MustWorkspaceClient
+	cmd.RunE = func(cmd *cobra.Command, args []string) (err error) {
+		ctx := cmd.Context()
+		w := cmdctx.WorkspaceClient(ctx)
+
+		genieCancelResponseReq.AgentId = args[0]
+		genieCancelResponseReq.ConversationId = args[1]
+		genieCancelResponseReq.ResponseId = args[2]
+
+		response, err := w.Genie.GenieCancelResponse(ctx, genieCancelResponseReq)
+		if err != nil {
+			return err
+		}
+
+		return cmdio.Render(ctx, response)
+	}
+
+	// Disable completions since they are not applicable.
+	// Can be overridden by manual implementation in `override.go`.
+	cmd.ValidArgsFunction = cobra.NoFileCompletions
+
+	// Apply optional overrides to this command.
+	for _, fn := range genieCancelResponseOverrides {
+		fn(cmd, &genieCancelResponseReq)
+	}
+
+	return cmd
+}
+
 // start genie-create-eval-run command
 
 // Slice with functions to override default command behavior.
@@ -706,16 +856,21 @@ func newGenieCreateEvalRun() *cobra.Command {
 	// TODO: array: benchmark_question_ids
 
 	cmd.Use = "genie-create-eval-run SPACE_ID"
-	cmd.Short = `Create eval run for benchmarks.`
-	cmd.Long = `Create eval run for benchmarks.
+	cmd.Short = `*Beta* Start a benchmark evaluation run.`
+	cmd.Long = `This command is in Beta and may change without notice.
 
-  Create and run evaluations for multiple benchmark questions in a Genie space.
+Start a benchmark evaluation run.
+
+  Creates and runs chat-mode evaluations for multiple benchmark questions in a
+  Genie space.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where the evaluations will be
       executed.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_BETA"
+	cmd.Annotations["launch_stage_display"] = "Beta"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -776,8 +931,10 @@ func newGenieGetEvalResultDetails() *cobra.Command {
 	var genieGetEvalResultDetailsReq dashboards.GenieGetEvalResultDetailsRequest
 
 	cmd.Use = "genie-get-eval-result-details SPACE_ID EVAL_RUN_ID RESULT_ID"
-	cmd.Short = `Get benchmark evaluation result details.`
-	cmd.Long = `Get benchmark evaluation result details.
+	cmd.Short = `*Beta* Get benchmark evaluation result details.`
+	cmd.Long = `This command is in Beta and may change without notice.
+
+Get benchmark evaluation result details.
 
   Get details for evaluation results.
 
@@ -788,6 +945,8 @@ func newGenieGetEvalResultDetails() *cobra.Command {
     RESULT_ID: The unique identifier for the evaluation result.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_BETA"
+	cmd.Annotations["launch_stage_display"] = "Beta"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -838,8 +997,10 @@ func newGenieGetEvalRun() *cobra.Command {
 	var genieGetEvalRunReq dashboards.GenieGetEvalRunRequest
 
 	cmd.Use = "genie-get-eval-run SPACE_ID EVAL_RUN_ID"
-	cmd.Short = `Get benchmark evaluation run.`
-	cmd.Long = `Get benchmark evaluation run.
+	cmd.Short = `*Beta* Get a benchmark evaluation run.`
+	cmd.Long = `This command is in Beta and may change without notice.
+
+Get a benchmark evaluation run.
 
   Get evaluation run details.
 
@@ -849,6 +1010,8 @@ func newGenieGetEvalRun() *cobra.Command {
     EVAL_RUN_ID: `
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_BETA"
+	cmd.Annotations["launch_stage_display"] = "Beta"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -901,8 +1064,10 @@ func newGenieListEvalResults() *cobra.Command {
 	cmd.Flags().StringVar(&genieListEvalResultsReq.PageToken, "page-token", genieListEvalResultsReq.PageToken, `Opaque token to retrieve the next page of results.`)
 
 	cmd.Use = "genie-list-eval-results SPACE_ID EVAL_RUN_ID"
-	cmd.Short = `List benchmark evaluation results.`
-	cmd.Long = `List benchmark evaluation results.
+	cmd.Short = `*Beta* List results for a benchmark evaluation run.`
+	cmd.Long = `This command is in Beta and may change without notice.
+
+List results for a benchmark evaluation run.
 
   List evaluation results for a specific evaluation run.
 
@@ -912,6 +1077,8 @@ func newGenieListEvalResults() *cobra.Command {
     EVAL_RUN_ID: The unique identifier for the evaluation run.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_BETA"
+	cmd.Annotations["launch_stage_display"] = "Beta"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -964,8 +1131,10 @@ func newGenieListEvalRuns() *cobra.Command {
 	cmd.Flags().StringVar(&genieListEvalRunsReq.PageToken, "page-token", genieListEvalRunsReq.PageToken, `Token to get the next page of results.`)
 
 	cmd.Use = "genie-list-eval-runs SPACE_ID"
-	cmd.Short = `List all evaluation runs in the space.`
-	cmd.Long = `List all evaluation runs in the space.
+	cmd.Short = `*Beta* List benchmark evaluation runs.`
+	cmd.Long = `This command is in Beta and may change without notice.
+
+List benchmark evaluation runs.
 
   Lists all evaluation runs in a space.
 
@@ -974,6 +1143,8 @@ func newGenieListEvalRuns() *cobra.Command {
       located.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_BETA"
+	cmd.Annotations["launch_stage_display"] = "Beta"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1022,8 +1193,8 @@ func newGetDownloadFullQueryResult() *cobra.Command {
 	var getDownloadFullQueryResultReq dashboards.GenieGetDownloadFullQueryResultRequest
 
 	cmd.Use = "get-download-full-query-result SPACE_ID CONVERSATION_ID MESSAGE_ID ATTACHMENT_ID DOWNLOAD_ID DOWNLOAD_ID_SIGNATURE"
-	cmd.Short = `Get download full query result.`
-	cmd.Long = `Get download full query result.
+	cmd.Short = `Get full query-result download status.`
+	cmd.Long = `Get full query-result download status.
 
   After [Generating a Full Query Result
   Download](:method:genie/generatedownloadfullqueryresult) and successfully
@@ -1038,12 +1209,10 @@ func newGetDownloadFullQueryResult() *cobra.Command {
   ### **Warning: Databricks strongly recommends that you protect the URLs that
   are returned by the EXTERNAL_LINKS disposition.**
 
-  When you use the EXTERNAL_LINKS disposition, a short-lived, URL is
-  generated, which can be used to download the results directly from . As a
-  short-lived is embedded in this URL, you should protect the URL.
-
-  Because URLs are already generated with embedded temporary s, you must not set
-  an Authorization header in the download requests.
+  When you use the EXTERNAL_LINKS disposition, a short-lived cloud-storage URL
+  is generated to download the results. The URL contains temporary access
+  credentials, so protect it and do not set an Authorization header in the
+  download request.
 
   See [Execute Statement](:method:statementexecution/executestatement) for more
   details.
@@ -1060,6 +1229,8 @@ func newGetDownloadFullQueryResult() *cobra.Command {
     DOWNLOAD_ID_SIGNATURE: JWT signature for the download_id to ensure secure access to query results`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(6)
@@ -1113,10 +1284,11 @@ func newGetMessage() *cobra.Command {
 	var getMessageReq dashboards.GenieGetConversationMessageRequest
 
 	cmd.Use = "get-message SPACE_ID CONVERSATION_ID MESSAGE_ID"
-	cmd.Short = `Get conversation message.`
-	cmd.Long = `Get conversation message.
+	cmd.Short = `Get a conversation message.`
+	cmd.Long = `Get a conversation message.
 
-  Get message from conversation.
+  Gets a message from a chat-mode or agent-mode conversation. For a complete
+  agent-mode transcript, use the List conversation items endpoint.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where the target conversation is
@@ -1126,6 +1298,8 @@ func newGetMessage() *cobra.Command {
       conversation.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -1176,8 +1350,8 @@ func newGetMessageAttachmentQueryResult() *cobra.Command {
 	var getMessageAttachmentQueryResultReq dashboards.GenieGetMessageAttachmentQueryResultRequest
 
 	cmd.Use = "get-message-attachment-query-result SPACE_ID CONVERSATION_ID MESSAGE_ID ATTACHMENT_ID"
-	cmd.Short = `Get message attachment SQL query result.`
-	cmd.Long = `Get message attachment SQL query result.
+	cmd.Short = `Get an attachment SQL result.`
+	cmd.Long = `Get an attachment SQL result.
 
   Get the result of SQL query if the message has a query attachment. This is
   only available if a message has a query attachment and the message status is
@@ -1190,6 +1364,8 @@ func newGetMessageAttachmentQueryResult() *cobra.Command {
     ATTACHMENT_ID: Attachment ID`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(4)
@@ -1256,6 +1432,8 @@ func newGetMessageQueryResult() *cobra.Command {
 	cmd.Hidden = true
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PRIVATE_PREVIEW"
+	cmd.Annotations["launch_stage_display"] = "Private Preview"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -1322,6 +1500,8 @@ func newGetMessageQueryResultByAttachment() *cobra.Command {
 	cmd.Hidden = true
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PRIVATE_PREVIEW"
+	cmd.Annotations["launch_stage_display"] = "Private Preview"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(4)
@@ -1375,8 +1555,8 @@ func newGetSpace() *cobra.Command {
 	cmd.Flags().BoolVar(&getSpaceReq.IncludeSerializedSpace, "include-serialized-space", getSpaceReq.IncludeSerializedSpace, `Whether to include the serialized space export in the response.`)
 
 	cmd.Use = "get-space SPACE_ID"
-	cmd.Short = `Get Genie Space.`
-	cmd.Long = `Get Genie Space.
+	cmd.Short = `Get a Genie space.`
+	cmd.Long = `Get a Genie space.
 
   Get details of a Genie Space.
 
@@ -1384,6 +1564,8 @@ func newGetSpace() *cobra.Command {
     SPACE_ID: The ID associated with the Genie space`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1435,8 +1617,10 @@ func newListConversationComments() *cobra.Command {
 	cmd.Flags().StringVar(&listConversationCommentsReq.PageToken, "page-token", listConversationCommentsReq.PageToken, `Pagination token for getting the next page of results.`)
 
 	cmd.Use = "list-conversation-comments SPACE_ID CONVERSATION_ID"
-	cmd.Short = `List conversation comments.`
-	cmd.Long = `List conversation comments.
+	cmd.Short = `*Public Preview* List all comments in a conversation.`
+	cmd.Long = `This command is in Public Preview and may change without notice.
+
+List all comments in a conversation.
 
   List all comments across all messages in a conversation.
 
@@ -1445,6 +1629,8 @@ func newListConversationComments() *cobra.Command {
     CONVERSATION_ID: The ID associated with the conversation.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_PREVIEW"
+	cmd.Annotations["launch_stage_display"] = "Public Preview"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -1500,13 +1686,17 @@ func newListConversationMessages() *cobra.Command {
 	cmd.Short = `List conversation messages.`
 	cmd.Long = `List conversation messages.
 
-  List messages in a conversation
+  Lists messages in a chat-mode or agent-mode conversation. Agent-mode messages
+  are returned as GenieMessage projections. Use the List conversation items
+  endpoint for the complete reasoning and tool-call history.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where the conversation is located
     CONVERSATION_ID: The ID of the conversation to list messages from`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -1560,8 +1750,8 @@ func newListConversations() *cobra.Command {
 	cmd.Flags().StringVar(&listConversationsReq.PageToken, "page-token", listConversationsReq.PageToken, `Token to get the next page of results.`)
 
 	cmd.Use = "list-conversations SPACE_ID"
-	cmd.Short = `List conversations in a Genie Space.`
-	cmd.Long = `List conversations in a Genie Space.
+	cmd.Short = `List conversations.`
+	cmd.Long = `List conversations.
 
   Get a list of conversations in a Genie Space.
 
@@ -1569,6 +1759,8 @@ func newListConversations() *cobra.Command {
     SPACE_ID: The ID of the Genie space to retrieve conversations from.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1620,8 +1812,10 @@ func newListMessageComments() *cobra.Command {
 	cmd.Flags().StringVar(&listMessageCommentsReq.PageToken, "page-token", listMessageCommentsReq.PageToken, `Pagination token for getting the next page of results.`)
 
 	cmd.Use = "list-message-comments SPACE_ID CONVERSATION_ID MESSAGE_ID"
-	cmd.Short = `List message comments.`
-	cmd.Long = `List message comments.
+	cmd.Short = `*Public Preview* List comments on a message.`
+	cmd.Long = `This command is in Public Preview and may change without notice.
+
+List comments on a message.
 
   List comments on a specific conversation message.
 
@@ -1631,6 +1825,8 @@ func newListMessageComments() *cobra.Command {
     MESSAGE_ID: The ID associated with the message.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "PUBLIC_PREVIEW"
+	cmd.Annotations["launch_stage_display"] = "Public Preview"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -1690,6 +1886,8 @@ func newListSpaces() *cobra.Command {
   Get list of Genie Spaces.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(0)
@@ -1741,10 +1939,10 @@ func newSendMessageFeedback() *cobra.Command {
 	cmd.Flags().StringVar(&sendMessageFeedbackReq.Comment, "comment", sendMessageFeedbackReq.Comment, `Optional text feedback that will be stored as a comment.`)
 
 	cmd.Use = "send-message-feedback SPACE_ID CONVERSATION_ID MESSAGE_ID RATING"
-	cmd.Short = `Send message feedback.`
-	cmd.Long = `Send message feedback.
+	cmd.Short = `Send feedback on a message.`
+	cmd.Long = `Send feedback on a message.
 
-  Send feedback for a message.
+  Sends feedback for a message in a chat-mode or agent-mode conversation.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where the message is located.
@@ -1754,12 +1952,14 @@ func newSendMessageFeedback() *cobra.Command {
       Supported values: [NEGATIVE, NONE, POSITIVE]`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(3)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only SPACE_ID, CONVERSATION_ID, MESSAGE_ID as positional arguments. Provide 'rating' in your JSON input")
+				return errors.New("when --json flag is specified, provide only SPACE_ID, CONVERSATION_ID, MESSAGE_ID as positional arguments. Provide 'rating' in your JSON input")
 			}
 			return nil
 		}
@@ -1837,11 +2037,13 @@ func newStartConversation() *cobra.Command {
 
 	cmd.Flags().Var(&startConversationJson, "json", `either inline JSON string or @path/to/file.json with request body`)
 
-	cmd.Use = "start-conversation SPACE_ID CONTENT"
-	cmd.Short = `Start conversation.`
-	cmd.Long = `Start conversation.
+	cmd.Flags().BoolVar(&startConversationReq.EnableVisualization, "enable-visualization", startConversationReq.EnableVisualization, `Enable visualization generation.`)
 
-  Start a new conversation.
+	cmd.Use = "start-conversation SPACE_ID CONTENT"
+	cmd.Short = `Chat mode: Start a conversation.`
+	cmd.Long = `Chat mode: Start a conversation.
+
+  Starts a new chat-mode conversation and sends its first message.
 
   Arguments:
     SPACE_ID: The ID associated with the Genie space where you want to start a
@@ -1849,12 +2051,14 @@ func newStartConversation() *cobra.Command {
     CONTENT: The text of the message that starts the conversation.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(1)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only SPACE_ID as positional arguments. Provide 'content' in your JSON input")
+				return errors.New("when --json flag is specified, provide only SPACE_ID as positional arguments. Provide 'content' in your JSON input")
 			}
 			return nil
 		}
@@ -1931,8 +2135,8 @@ func newTrashSpace() *cobra.Command {
 	var trashSpaceReq dashboards.GenieTrashSpaceRequest
 
 	cmd.Use = "trash-space SPACE_ID"
-	cmd.Short = `Trash Genie Space.`
-	cmd.Long = `Trash Genie Space.
+	cmd.Short = `Trash a Genie space.`
+	cmd.Long = `Trash a Genie space.
 
   Move a Genie Space to the trash.
 
@@ -1940,6 +2144,8 @@ func newTrashSpace() *cobra.Command {
     SPACE_ID: The ID associated with the Genie space to be sent to the trash.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1990,13 +2196,15 @@ func newUpdateSpace() *cobra.Command {
 	cmd.Flags().Var(&updateSpaceJson, "json", `either inline JSON string or @path/to/file.json with request body`)
 
 	cmd.Flags().StringVar(&updateSpaceReq.Description, "description", updateSpaceReq.Description, `Optional description.`)
+	cmd.Flags().StringVar(&updateSpaceReq.Etag, "etag", updateSpaceReq.Etag, `ETag returned by a previous GET or UPDATE.`)
+	cmd.Flags().StringVar(&updateSpaceReq.ParentPath, "parent-path", updateSpaceReq.ParentPath, `Parent workspace folder path to move this Genie space under.`)
 	cmd.Flags().StringVar(&updateSpaceReq.SerializedSpace, "serialized-space", updateSpaceReq.SerializedSpace, `The contents of the Genie Space in serialized string form (full replacement).`)
 	cmd.Flags().StringVar(&updateSpaceReq.Title, "title", updateSpaceReq.Title, `Optional title override.`)
 	cmd.Flags().StringVar(&updateSpaceReq.WarehouseId, "warehouse-id", updateSpaceReq.WarehouseId, `Optional warehouse override.`)
 
 	cmd.Use = "update-space SPACE_ID"
-	cmd.Short = `Update Genie Space.`
-	cmd.Long = `Update Genie Space.
+	cmd.Short = `Update a Genie space.`
+	cmd.Long = `Update a Genie space.
 
   Updates a Genie space with a serialized payload.
 
@@ -2004,6 +2212,8 @@ func newUpdateSpace() *cobra.Command {
     SPACE_ID: Genie space ID`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)

@@ -3,6 +3,13 @@ package config
 type Experimental struct {
 	Scripts map[ScriptHook]Command `json:"scripts,omitempty"`
 
+	// ImmutableFolder specifies that bundle files and artifacts are uploaded as a
+	// single immutable snapshot rather than being synced individually. When true,
+	// the deployment calls /api/2.0/repos/snapshots with a zip of all files and sets
+	// workspace.file_path and workspace.artifact_path to the returned content-addressed
+	// path.
+	ImmutableFolder bool `json:"immutable_folder,omitempty"`
+
 	// By default Python wheel tasks deployed as is to Databricks platform.
 	// If notebook wrapper required (for example, used in DBR < 13.1 or other configuration differences), users can provide a following experimental setting
 	// experimental:
@@ -42,6 +49,15 @@ type Experimental struct {
 	// Eventually this can be made the default once we have native CRUD in DABs
 	// at which point we can deprecate or remove this field all together.
 	SkipNamePrefixForSchema bool `json:"skip_name_prefix_for_schema,omitempty"`
+
+	// DeploymentHistory opts the bundle into the deployment metadata
+	// service (DMS), which records deployment history and tracks what changed
+	// across deployments.
+	//
+	// Only for bundles with no deployed resources yet: DMS becomes the source of
+	// truth for their state.
+	// An explicit value takes priority over the environment setting.
+	DeploymentHistory *bool `json:"deployment_history,omitempty"`
 }
 
 type Python struct {

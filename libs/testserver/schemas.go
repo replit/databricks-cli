@@ -4,12 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
-	"dario.cat/mergo"
 	"github.com/databricks/databricks-sdk-go/service/catalog"
 )
 
 const testMetastoreName = "deco-uc-prod-isolated-aws-us-east-1"
+
+// schemaNameManagedDefaults is the schema name the backend-default drift test uses
+// to opt into UC's managed-property simulation. Scoping the injection to this name
+// keeps unrelated schema tests free of the property, which terraform would otherwise
+// report as drift on redeploy.
+const schemaNameManagedDefaults = "schema_managed_defaults"
 
 func (s *FakeWorkspace) SchemasCreate(req Request) Response {
 	defer s.LockUnlock()()
@@ -23,6 +29,10 @@ func (s *FakeWorkspace) SchemasCreate(req Request) Response {
 		}
 	}
 
+	// UC normalizes schema names to lowercase.
+	schema.Name = strings.ToLower(schema.Name)
+	// Strip trailing slash to mimic UC API normalization behavior (see volumes.go).
+	schema.StorageRoot = strings.TrimRight(schema.StorageRoot, "/")
 	schema.FullName = schema.CatalogName + "." + schema.Name
 	schema.ForceSendFields = []string{"BrowseOnly"}
 	schema.CatalogType = "MANAGED_CATALOG"
@@ -33,12 +43,27 @@ func (s *FakeWorkspace) SchemasCreate(req Request) Response {
 	schema.EffectivePredictiveOptimizationFlag = &catalog.EffectivePredictiveOptimizationFlag{
 		InheritedFromName: testMetastoreName,
 		InheritedFromType: catalog.EffectivePredictiveOptimizationFlagInheritedFromType("METASTORE"),
-		Value:             catalog.EnablePredictiveOptimizationEnable,
+		// Mirror the real test metastore, which inherits ENABLE, so a single
+		// golden stays valid for both local and cloud runs.
+		Value: catalog.EnablePredictiveOptimizationEnable,
 	}
 	schema.EnablePredictiveOptimization = catalog.EnablePredictiveOptimizationInherit
 	schema.MetastoreId = TestMetastore.MetastoreId
 	schema.Owner = s.CurrentUser().UserName
 	schema.SchemaId = nextUUID()
+	if schema.Properties == nil && schema.Name == schemaNameManagedDefaults {
+		// Mirror UC behavior: managed system defaults are populated when the user
+		// doesn't specify any properties. Required to cover backend-default drift.
+		schema.Properties = map[string]string{
+			"unity.catalog.managed.delta.defaults.delta.enableRowTracking":                   "true",
+			"unity.catalog.managed.iceberg.defaults.delta.feature.catalogManaged":            "true",
+			"unity.catalog.managed.delta.defaults.defaultClusterByAuto":                      "true",
+			"unity.catalog.managed.delta.defaults.delta.checkpointPolicy":                    "v2",
+			"unity.catalog.managed.delta.defaults.delta.parquet.format.version":              "2.12.0",
+			"unity.catalog.managed.delta.defaults.delta.parquet.format.version.afe.internal": "2.12.0",
+			"unity.catalog.managed.delta.defaults.delta.feature.catalogManaged":              "supported",
+		}
+	}
 	s.Schemas[schema.FullName] = schema
 
 	return Response{
@@ -56,6 +81,11 @@ func (s *FakeWorkspace) SchemasUpdate(req Request, name string) Response {
 		}
 	}
 
+	fields, errResponse := parseUCUpdate(req.Body, "UpdateSchema")
+	if errResponse != nil {
+		return *errResponse
+	}
+
 	var schemaUpdate catalog.SchemaInfo
 
 	if err := json.Unmarshal(req.Body, &schemaUpdate); err != nil {
@@ -65,13 +95,7 @@ func (s *FakeWorkspace) SchemasUpdate(req Request, name string) Response {
 		}
 	}
 
-	err := mergo.Merge(&existing, schemaUpdate, mergo.WithOverride)
-	if err != nil {
-		return Response{
-			Body:       fmt.Sprintf("mergo error: %s", err),
-			StatusCode: http.StatusInternalServerError,
-		}
-	}
+	applyUpdatedFields(&existing, schemaUpdate, fields)
 
 	existing.UpdatedAt = nowMilli()
 	existing.UpdatedBy = s.CurrentUser().UserName

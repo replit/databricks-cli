@@ -12,6 +12,7 @@ import (
 	configresources "github.com/databricks/cli/bundle/config/resources"
 	"github.com/databricks/cli/bundle/resources"
 	"github.com/databricks/cli/bundle/run"
+	"github.com/databricks/cli/libs/auth"
 	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/cli/libs/logdiag"
@@ -186,7 +187,7 @@ func fetchAllPipelineEvents(ctx context.Context, w *databricks.WorkspaceClient, 
 		ctx,
 		"GET",
 		path,
-		nil,
+		auth.WorkspaceIDHeaders(w.Config),
 		nil,
 		queryParams,
 		&response,
@@ -278,6 +279,10 @@ func updatesAfter(updates []pipelines.UpdateInfo, ts int64) []pipelines.UpdateIn
 // assuming updates are in descending order, largest CreationTime first.
 // Time is in milliseconds since epoch. If time is nil, it is ignored.
 func filterUpdates(updates []pipelines.UpdateInfo, startTime, endTime *int64) ([]pipelines.UpdateInfo, error) {
+	if len(updates) == 0 {
+		return updates, nil
+	}
+
 	if (endTime == nil || updates[0].CreationTime <= *endTime) && (startTime == nil || updates[len(updates)-1].CreationTime >= *startTime) {
 		return updates, nil
 	}

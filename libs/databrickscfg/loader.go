@@ -1,18 +1,62 @@
 package databrickscfg
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"strings"
 
+	"github.com/databricks/cli/libs/databrickscfg/profile"
 	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/databricks-sdk-go/config"
 	"gopkg.in/ini.v1"
 )
 
 var ResolveProfileFromHost = profileFromHostLoader{}
+
+// ResolveNonAuthFromEnv reads non-auth, non-host config from environment
+// variables. See ProfileAuthLoaders for how it fits into the chain.
+var ResolveNonAuthFromEnv = envLoader{name: "environment (excluding auth)", skipAuth: true}
+
+// resolveAuthGapFromEnv gap-fills the auth attributes and host the profile left
+// empty from environment variables. See ProfileAuthLoaders for how it fits into
+// the chain.
+var resolveAuthGapFromEnv = envLoader{name: "environment (auth gap-fill)", skipAuth: false}
+
+// ProfileAuthLoaders is the loader chain for an explicitly selected profile
+// (--profile or a bundle's workspace.profile). Unlike the SDK's default
+// env-first chain, the profile wins over auth env vars (#5096):
+//
+//  1. ResolveNonAuthFromEnv: non-auth env attrs (e.g. cluster_id), env-wins.
+//  2. ConfigFile: the selected profile (host, routing, auth).
+//  3. resolveAuthGapFromEnv: gap-fills the auth attrs and host the profile left
+//     empty from env, so a host-less profile still reaches the env host and a
+//     complete conflicting env auth method surfaces as an error rather than being
+//     silently dropped. It skips envAlwaysSkipAttrs so routing/auth-steering
+//     attrs come from the profile only; using the SDK's ConfigAttributes here
+//     would let those env vars shadow the profile (e.g. DATABRICKS_AUTH_TYPE=basic
+//     over a PAT profile).
+//
+// A profile from DATABRICKS_CONFIG_PROFILE keeps env-first precedence; only an
+// out-of-band profile name triggers this chain.
+var ProfileAuthLoaders = []config.Loader{
+	ResolveNonAuthFromEnv,
+	config.ConfigFile,
+	resolveAuthGapFromEnv,
+}
+
+// StrictProfileLoaders is ProfileAuthLoaders with strictProfileLoader before
+// the config file. The profile name always comes from the config file, based on
+// the host and workspace ID in the bundle configuration, even when auth env vars
+// are set.
+var StrictProfileLoaders = []config.Loader{
+	ResolveNonAuthFromEnv,
+	strictProfileLoader{},
+	config.ConfigFile,
+	resolveAuthGapFromEnv,
+}
 
 var errNoMatchingProfiles = errors.New("no matching config profiles found")
 
@@ -25,8 +69,7 @@ func (e errMultipleProfiles) Error() string {
 // AsMultipleProfiles checks if the error is caused by multiple profiles
 // matching the same host. If so, it returns the matching profile names.
 func AsMultipleProfiles(err error) ([]string, bool) {
-	var e errMultipleProfiles
-	if errors.As(err, &e) {
+	if e, ok := errors.AsType[errMultipleProfiles](err); ok {
 		return []string(e), true
 	}
 	return nil, false
@@ -59,6 +102,69 @@ func findMatchingProfile(configFile *config.File, matcher func(*ini.Section) boo
 	}
 
 	return matching[0], nil
+}
+
+// hostAttr is the SDK config attribute name for the workspace/account host.
+const hostAttr = "host"
+
+// envAlwaysSkipAttrs lists env attributes envLoader must never read when a
+// profile is explicitly selected, in either pass: routing (workspace_id,
+// account_id) and auth-steering fields tagged auth:"-" (auth_type, discovery_url,
+// audience, cloud), which HasAuthAttribute misses. Reading these from env — even
+// as a gap-fill — would re-steer or shadow the selected profile's auth (#5096).
+// The host is deliberately absent: like the auth attrs it is skipped only in the
+// env-first pass (see envLoader), then gap-filled after the profile so a
+// host-less profile falls back to the env host.
+// TestEnvAlwaysSkipAttrsCoverSDKInternalEnvAttrs guards against SDK drift.
+var envAlwaysSkipAttrs = map[string]bool{
+	"workspace_id":  true,
+	"account_id":    true,
+	"auth_type":     true,
+	"discovery_url": true,
+	"audience":      true,
+	"cloud":         true,
+}
+
+// envLoader reads config attributes from environment variables. It always skips
+// envAlwaysSkipAttrs so routing/auth-steering attrs come from the selected
+// profile only (#5096). When skipAuth is true it additionally skips the SDK's
+// auth attributes and the host, for the env-first pass that runs before the
+// profile; the gap-fill pass then fills the ones the profile left empty.
+type envLoader struct {
+	name     string
+	skipAuth bool
+}
+
+func (l envLoader) Name() string {
+	return l.name
+}
+
+func (l envLoader) Configure(cfg *config.Config) error {
+	for _, attr := range config.ConfigAttributes {
+		// Routing/auth-steering come from the profile (config file), not env.
+		if envAlwaysSkipAttrs[attr.Name] {
+			continue
+		}
+		// The env-first pass leaves the auth attrs and host for the profile; the
+		// gap-fill pass runs after the profile and fills only those it left empty.
+		if l.skipAuth && (attr.HasAuthAttribute() || attr.Name == hostAttr) {
+			continue
+		}
+		// Don't overwrite an already-set value (SDK loader semantics).
+		if !attr.IsZero(cfg) {
+			continue
+		}
+		v, envName := attr.ReadEnv()
+		if v == "" {
+			continue
+		}
+		if err := attr.SetS(cfg, v); err != nil {
+			return err
+		}
+		// Record the source so `auth describe` attributes the value to env.
+		cfg.SetAttrSource(&attr, config.Source{Type: config.SourceEnv, Name: envName})
+	}
+	return nil
 }
 
 type profileFromHostLoader struct{}
@@ -95,7 +201,7 @@ func (l profileFromHostLoader) Configure(cfg *config.Config) error {
 		// Check if this section matches the normalized host
 		return normalizeHost(key.Value()) == host
 	})
-	if err == errNoMatchingProfiles {
+	if errors.Is(err, errNoMatchingProfiles) {
 		return nil
 	}
 
@@ -104,7 +210,7 @@ func (l profileFromHostLoader) Configure(cfg *config.Config) error {
 	if names, ok := AsMultipleProfiles(err); ok && cfg.WorkspaceID != "" {
 		originalErr := err
 		match, err = l.disambiguateByWorkspaceID(ctx, configFile, host, cfg.WorkspaceID, names)
-		if err == errNoMatchingProfiles {
+		if errors.Is(err, errNoMatchingProfiles) {
 			// workspace_id didn't match any of the host-matching profiles.
 			// Fall back to the original ambiguity error.
 			log.Debugf(ctx, "workspace_id=%s did not match any profiles for host %s: %v", cfg.WorkspaceID, host, names)
@@ -174,4 +280,99 @@ func (l profileFromHostLoader) isAnyAuthConfigured(cfg *config.Config) bool {
 	// If the auth type is set, we can skip profile resolution.
 	// For example, to force "azure-cli", only the host and the auth type will be set.
 	return cfg.AuthType != ""
+}
+
+// strictProfileLoader selects the profile like profileFromHostLoader, but it
+// always runs and fails when there is no single match, so credentials from the
+// environment only reach a host and workspace that a profile allows. Each
+// workspace profile allows one pair of host and workspace ID, and a profile
+// without a workspace_id allows a config without one. Account profiles are
+// skipped. A config with a workspace ID but no host uses the profile it names.
+type strictProfileLoader struct{}
+
+func (strictProfileLoader) Name() string {
+	return "strict-profile-match"
+}
+
+func (strictProfileLoader) Configure(cfg *config.Config) error {
+	// Without a host or workspace ID there is nothing to match, so the next
+	// loaders resolve the config as without strict mode.
+	if cfg.Host == "" && cfg.WorkspaceID == "" {
+		return nil
+	}
+
+	configFile, err := config.LoadFile(cfg.ConfigFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("strict profile matching: config file %s not found", cmp.Or(cfg.ConfigFile, "~/.databrickscfg"))
+	}
+	if err != nil {
+		return fmt.Errorf("strict profile matching: %w", err)
+	}
+	if cfg.Host == "" {
+		return checkNamedProfile(cfg, configFile)
+	}
+
+	host := normalizeHost(cfg.Host)
+	var hostMatches, matches []string
+	for _, s := range configFile.Sections() {
+		if normalizeHost(sectionValue(s, hostAttr)) != host || !isWorkspaceSection(s) {
+			continue
+		}
+		hostMatches = append(hostMatches, s.Name())
+		if sectionValue(s, "workspace_id") == cfg.WorkspaceID {
+			matches = append(matches, s.Name())
+		}
+	}
+	switch {
+	case len(matches) > 1:
+		return fmt.Errorf("strict profile matching: multiple profiles match host %s: %s", cfg.Host, strings.Join(matches, ", "))
+	case len(hostMatches) == 0:
+		return fmt.Errorf("strict profile matching: no workspace profile matches host %s", cfg.Host)
+	case len(matches) == 0 && cfg.WorkspaceID == "":
+		return fmt.Errorf("strict profile matching: host %s requires a workspace ID; set workspace.workspace_id or add ?o=<workspace-id> to workspace.host", cfg.Host)
+	case len(matches) == 0:
+		return fmt.Errorf("strict profile matching: no profile for host %s has workspace_id %s", cfg.Host, cfg.WorkspaceID)
+	}
+
+	// A CLI started from a bundle script receives the selected profile through
+	// DATABRICKS_CONFIG_PROFILE, so only a different profile is an error.
+	if cfg.Profile != "" && cfg.Profile != matches[0] {
+		return fmt.Errorf("strict profile matching: profile %s does not match profile %s selected for host %s", cfg.Profile, matches[0], cfg.Host)
+	}
+	cfg.Profile = matches[0]
+	return nil
+}
+
+// checkNamedProfile checks the profile named by a config with a workspace ID but
+// no host. There is no host in the config to compare, so the host comes from the
+// named profile, and the profile must have the config's workspace ID.
+func checkNamedProfile(cfg *config.Config, configFile *config.File) error {
+	if cfg.Profile == "" {
+		return fmt.Errorf("strict profile matching: workspace_id %s needs a host; set workspace.host, or select a profile with --profile, workspace.profile or [__settings__].default_profile", cfg.WorkspaceID)
+	}
+	s, err := configFile.GetSection(cfg.Profile)
+	if err != nil || sectionValue(s, hostAttr) == "" || !isWorkspaceSection(s) {
+		return fmt.Errorf("strict profile matching: %s is not a workspace profile with a host in the config file", cfg.Profile)
+	}
+	if sectionValue(s, "workspace_id") != cfg.WorkspaceID {
+		return fmt.Errorf("strict profile matching: profile %s does not have workspace_id %s", cfg.Profile, cfg.WorkspaceID)
+	}
+	return nil
+}
+
+func isWorkspaceSection(s *ini.Section) bool {
+	return profile.MatchWorkspaceProfiles(profile.Profile{
+		AccountID:   sectionValue(s, "account_id"),
+		WorkspaceID: sectionValue(s, "workspace_id"),
+	})
+}
+
+// sectionValue returns the value of a key, or "" when the section doesn't have
+// it. Unlike Section.Key, it doesn't add a missing key to the section.
+func sectionValue(s *ini.Section, name string) string {
+	key, err := s.GetKey(name)
+	if err != nil {
+		return ""
+	}
+	return key.Value()
 }

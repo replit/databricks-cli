@@ -11,17 +11,36 @@ import (
 var resourceURLPatterns = map[string]string{
 	"alerts":                  "sql/alerts-v2/%s",
 	"apps":                    "apps/%s",
+	"catalogs":                "explore/data/%s",
+	"cluster_policies":        "compute/policies/%s",
 	"clusters":                "compute/clusters/%s",
 	"dashboards":              "dashboardsv3/%s/published",
+	"database_catalogs":       "explore/data/%s",
+	"database_instances":      "compute/database-instances/%s",
 	"experiments":             "ml/experiments/%s",
+	"features":                "explore/data/features/%s",
+	"genie_spaces":            "genie/rooms/%s",
 	"jobs":                    "jobs/%s",
+	"mcp_services":            "explore/data/mcp-services/%s",
 	"models":                  "ml/models/%s",
 	"model_serving_endpoints": "ml/endpoints/%s",
+	"model_services":          "explore/data/model-services/%s",
+	"model_provider_services": "explore/data/model-provider-services/%s",
 	"notebooks":               "#notebook/%s",
 	"pipelines":               "pipelines/%s",
+	"postgres_catalogs":       "explore/data/%s",
+	"postgres_synced_tables":  "explore/data/%s",
+	"quality_monitors":        "explore/data/%s",
 	"queries":                 "sql/editor/%s",
 	"registered_models":       "explore/data/models/%s",
+	"schemas":                 "explore/data/%s",
+	"secrets":                 "explore/data/%s",
+	"synced_database_tables":  "explore/data/%s",
+	"vector_search_endpoints": "compute/vector-search/%s",
+	"vector_search_indexes":   "explore/data/%s",
+	"volumes":                 "explore/data/volumes/%s",
 	"warehouses":              "sql/warehouses/%s",
+	"instance_pools":          "compute/instance-pools/%s",
 }
 
 // resourceAliases lets callers use bundle-config plural names as synonyms for
@@ -37,7 +56,18 @@ var resourceAliases = map[string]string{
 // provided as a dot-separated name (e.g. "catalog.schema.model") but the URL
 // requires slash-separated segments.
 var dotSeparatedResources = map[string]bool{
-	"registered_models": true,
+	"catalogs":                true,
+	"features":                true,
+	"mcp_services":            true,
+	"model_services":          true,
+	"model_provider_services": true,
+	"postgres_synced_tables":  true,
+	"quality_monitors":        true,
+	"registered_models":       true,
+	"schemas":                 true,
+	"secrets":                 true,
+	"vector_search_indexes":   true,
+	"volumes":                 true,
 }
 
 // ResourceTypes returns a sorted list of all supported resource type names.
@@ -48,6 +78,83 @@ func ResourceTypes() []string {
 	}
 	slices.Sort(names)
 	return names
+}
+
+// DeploymentURL returns the workspace URL for a bundle deployment:
+// <host>/deployments/<deploymentID>?version=<version>. Version pins the page to the deploy that produced it.
+func DeploymentURL(baseURL url.URL, deploymentID string, version int) string {
+	if deploymentID == "" {
+		return ""
+	}
+
+	baseURL.Path = "deployments/" + deploymentID
+	if version > 0 {
+		values := baseURL.Query()
+		values.Set("version", strconv.Itoa(version))
+		baseURL.RawQuery = values.Encode()
+	}
+	return baseURL.String()
+}
+
+// JobRunPath returns the modern workspace path for a job run, of the form
+//
+//	jobs/<jobID>/runs/<runID>
+//
+// Callers join this onto a workspace base URL. It exists because the Jobs API
+// returns a legacy fragment URL (#job/<jobID>/run/<runID>) that relies on
+// client-side redirection that only resolves for workspace admins; non-admin
+// users with CAN_VIEW are sent to the workspace homepage instead. The modern
+// path form resolves for any user permitted to view the run.
+// See https://github.com/databricks/cli/issues/5142.
+func JobRunPath(jobID, runID string) string {
+	return fmt.Sprintf("jobs/%s/runs/%s", jobID, runID)
+}
+
+// JobRunURL constructs a workspace URL for a job run. Unlike ResourceURL it takes
+// two IDs (parent job and run), so it can't be a single entry in
+// resourceURLPatterns.
+func JobRunURL(baseURL url.URL, jobID, runID string) string {
+	baseURL.Path = JobRunPath(jobID, runID)
+	return baseURL.String()
+}
+
+// ModernizeJobRunPageURL converts the legacy run URL returned by the Jobs API
+//
+//	https://<host>/?o=<id>#job/<jobID>/run/<runID>
+//
+// into the modern path form
+//
+//	https://<host>/jobs/<jobID>/runs/<runID>?o=<id>
+//
+// so that non-admin users permitted to view the run are not redirected to the
+// workspace homepage. See https://github.com/databricks/cli/issues/5142. The
+// workspace selector query param (o) is preserved as-is. The conversion is
+// cosmetic, so the original URL is returned on the rare chance the format is
+// unexpected.
+func ModernizeJobRunPageURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	jobID, runID, ok := parseLegacyRunFragment(u.Fragment)
+	if !ok {
+		return raw
+	}
+
+	u.Fragment = ""
+	u.Path = "/" + JobRunPath(jobID, runID)
+	return u.String()
+}
+
+// parseLegacyRunFragment extracts the job and run IDs from a legacy run URL
+// fragment of the form "job/<jobID>/run/<runID>".
+func parseLegacyRunFragment(fragment string) (jobID, runID string, ok bool) {
+	parts := strings.Split(fragment, "/")
+	if len(parts) != 4 || parts[0] != "job" || parts[2] != "run" || parts[1] == "" || parts[3] == "" {
+		return "", "", false
+	}
+	return parts[1], parts[3], true
 }
 
 // ResourceURL constructs a workspace URL for a named resource type and ID.
@@ -62,9 +169,11 @@ func ResourceURL(baseURL url.URL, resourceType, id string) string {
 }
 
 // BuildResourceURL constructs a full workspace URL from a host string, resource
-// type name, ID, and workspace ID. It parses the host, appends ?o=<workspace-id>
-// when needed, and formats the resource path.
-func BuildResourceURL(host, resourceType, id string, workspaceID int64) (string, error) {
+// type name, ID, and workspace ID. It parses the host, appends ?w=<workspace-id>
+// when needed, and formats the resource path. An empty workspaceID skips the
+// query parameter (use when the workspace ID is unknown or already encoded in
+// the hostname).
+func BuildResourceURL(host, resourceType, id, workspaceID string) (string, error) {
 	baseURL, err := workspaceBaseURL(host, workspaceID)
 	if err != nil {
 		return "", err
@@ -84,23 +193,22 @@ func resolveAlias(resourceType string) string {
 	return resourceType
 }
 
-func workspaceBaseURL(host string, workspaceID int64) (*url.URL, error) {
+func workspaceBaseURL(host, workspaceID string) (*url.URL, error) {
 	baseURL, err := url.Parse(host)
 	if err != nil {
 		return nil, fmt.Errorf("invalid workspace host %q: %w", host, err)
 	}
 
-	if workspaceID == 0 {
+	if workspaceID == "" {
 		return baseURL, nil
 	}
 
-	orgID := strconv.FormatInt(workspaceID, 10)
-	if hasWorkspaceIDInHostname(baseURL.Hostname(), orgID) {
+	if hasWorkspaceIDInHostname(baseURL.Hostname(), workspaceID) {
 		return baseURL, nil
 	}
 
 	values := baseURL.Query()
-	values.Add("o", orgID)
+	values.Add("w", workspaceID)
 	baseURL.RawQuery = values.Encode()
 
 	return baseURL, nil

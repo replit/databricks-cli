@@ -19,19 +19,33 @@ type PostgresEndpointConfig struct {
 
 	// Parent is the branch containing this endpoint. Format: "projects/{project_id}/branches/{branch_id}"
 	Parent string `json:"parent"`
+
+	// ReplaceExisting, when true, takes over an existing endpoint with the same ID
+	// instead of returning ALREADY_EXISTS. Used to manage the implicitly-created
+	// primary read-write endpoint of a new branch. Input-only: not returned by the GET API.
+	ReplaceExisting bool `json:"replace_existing,omitempty"`
 }
 
 func (c *PostgresEndpointConfig) UnmarshalJSON(b []byte) error {
 	return marshal.Unmarshal(b, c)
 }
 
-func (c *PostgresEndpointConfig) MarshalJSON() ([]byte, error) {
+func (c PostgresEndpointConfig) MarshalJSON() ([]byte, error) {
 	return marshal.Marshal(c)
 }
 
 type PostgresEndpoint struct {
 	BaseResource
+	ID string `json:"id,omitempty" bundle:"readonly"`
 	PostgresEndpointConfig
+}
+
+func (e *PostgresEndpoint) UnmarshalJSON(b []byte) error {
+	return marshal.Unmarshal(b, e)
+}
+
+func (e PostgresEndpoint) MarshalJSON() ([]byte, error) {
+	return marshal.Marshal(e)
 }
 
 func (e *PostgresEndpoint) Exists(ctx context.Context, w *databricks.WorkspaceClient, name string) (bool, error) {
@@ -53,13 +67,14 @@ func (e *PostgresEndpoint) ResourceDescription() ResourceDescription {
 }
 
 func (e *PostgresEndpoint) GetName() string {
-	// Endpoints don't have a user-visible name field
-	return ""
+	// Endpoints have no name field of their own; the resource name is the ID
+	// ("projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}").
+	return e.ID
 }
 
-func (e *PostgresEndpoint) GetURL() string {
+func (e *PostgresEndpoint) GetURL() (string, bool) {
 	// The IDs in the API do not (yet) map to IDs in the web UI.
-	return ""
+	return "", false
 }
 
 func (e *PostgresEndpoint) InitializeURL(_ url.URL) {

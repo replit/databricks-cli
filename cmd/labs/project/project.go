@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/databricks/cli/cmd/labs/github"
+	"github.com/databricks/cli/libs/atomicfile"
 	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/env"
 	"github.com/databricks/cli/libs/log"
@@ -291,7 +292,7 @@ func (p *Project) writeVersionFile(ctx context.Context, ver string) error {
 		return err
 	}
 	log.Debugf(ctx, "Writing installed version info to: %s", versionFile)
-	return os.WriteFile(versionFile, raw, ownerRW)
+	return atomicfile.Write(versionFile, raw, ownerRW)
 }
 
 // checkUpdates is called before every command of an installed project,
@@ -307,6 +308,10 @@ func (p *Project) checkUpdates(cmd *cobra.Command) error {
 	versions, err := r.Load(ctx)
 	if err != nil {
 		return err
+	}
+	// Repositories without releases (and the offline fallback) yield no versions; nothing to advise on.
+	if len(versions) == 0 {
+		return nil
 	}
 	installed, err := p.InstalledVersion(ctx)
 	if err != nil {

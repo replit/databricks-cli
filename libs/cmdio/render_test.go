@@ -87,85 +87,91 @@ func must[T any](a T, e error) T {
 	return a
 }
 
-var testCases = []testCase{
-	{
-		name:           "Workspace with header and template",
-		v:              dummyWorkspace1,
-		outputFormat:   flags.OutputText,
-		headerTemplate: "id\tname",
-		template:       "{{.WorkspaceId}}\t{{.WorkspaceName}}",
-		expected: `id   name
+// makeTestCases builds the table fresh on every call. The Workspace_Iterator
+// rows wrap a stateful *dummyIterator that's consumed by Next; sharing one
+// across iterations of TestRender (which `go test -count=N` does) makes the
+// second run see an empty iterator and the test fails.
+func makeTestCases() []testCase {
+	return []testCase{
+		{
+			name:           "Workspace with header and template",
+			v:              dummyWorkspace1,
+			outputFormat:   flags.OutputText,
+			headerTemplate: "id\tname",
+			template:       "{{.WorkspaceId}}\t{{.WorkspaceName}}",
+			expected: `id   name
 123  abc`,
-	},
-	{
-		name:         "Workspace with no header and template",
-		v:            dummyWorkspace1,
-		outputFormat: flags.OutputText,
-		template:     "{{.WorkspaceId}}\t{{.WorkspaceName}}",
-		expected:     `123  abc`,
-	},
-	{
-		name:         "Workspace with no header and no template",
-		v:            dummyWorkspace1,
-		outputFormat: flags.OutputText,
-		expected: `{
+		},
+		{
+			name:         "Workspace with no header and template",
+			v:            dummyWorkspace1,
+			outputFormat: flags.OutputText,
+			template:     "{{.WorkspaceId}}\t{{.WorkspaceName}}",
+			expected:     `123  abc`,
+		},
+		{
+			name:         "Workspace with no header and no template",
+			v:            dummyWorkspace1,
+			outputFormat: flags.OutputText,
+			expected: `{
   "workspace_id": 123,
   "workspace_name": "abc"
 }
 `,
-	},
-	{
-		name:           "Workspace Iterator with header and template",
-		v:              makeIterator(2),
-		outputFormat:   flags.OutputText,
-		headerTemplate: "id\tname",
-		template:       "{{range .}}{{.WorkspaceId}}\t{{.WorkspaceName}}\n{{end}}",
-		expected: `id   name
+		},
+		{
+			name:           "Workspace Iterator with header and template",
+			v:              makeIterator(2),
+			outputFormat:   flags.OutputText,
+			headerTemplate: "id\tname",
+			template:       "{{range .}}{{.WorkspaceId}}\t{{.WorkspaceName}}\n{{end}}",
+			expected: `id   name
 123  abc
 456  def
 `,
-	},
-	{
-		name:         "Workspace Iterator with no header and template",
-		v:            makeIterator(2),
-		outputFormat: flags.OutputText,
-		template:     "{{range .}}{{.WorkspaceId}}\t{{.WorkspaceName}}\n{{end}}",
-		expected: `123  abc
+		},
+		{
+			name:         "Workspace Iterator with no header and template",
+			v:            makeIterator(2),
+			outputFormat: flags.OutputText,
+			template:     "{{range .}}{{.WorkspaceId}}\t{{.WorkspaceName}}\n{{end}}",
+			expected: `123  abc
 456  def
 `,
-	},
-	{
-		name:         "Workspace Iterator with no header and no template",
-		v:            makeIterator(2),
-		outputFormat: flags.OutputText,
-		expected:     string(must(json.MarshalIndent(makeWorkspaces(2), "", "  "))) + "\n",
-	},
-	{
-		name:           "Big Workspace Iterator with template",
-		v:              makeIterator(234),
-		outputFormat:   flags.OutputText,
-		headerTemplate: "id\tname",
-		template:       "{{range .}}{{.WorkspaceId}}\t{{.WorkspaceName}}\n{{end}}",
-		expected:       "id   name\n" + makeBigOutput(234),
-	},
-	{
-		name:         "Big Workspace Iterator with no template",
-		v:            makeIterator(234),
-		outputFormat: flags.OutputText,
-		expected:     string(must(json.MarshalIndent(makeWorkspaces(234), "", "  "))) + "\n",
-	},
-	{
-		name:         "io.Reader",
-		v:            strings.NewReader("a test"),
-		outputFormat: flags.OutputText,
-		expected:     "a test",
-	},
-	{
-		name:         "io.Reader",
-		v:            strings.NewReader("a test"),
-		outputFormat: flags.OutputJSON,
-		errMessage:   "json output not supported",
-	},
+		},
+		{
+			name:         "Workspace Iterator with no header and no template",
+			v:            makeIterator(2),
+			outputFormat: flags.OutputText,
+			expected:     string(must(json.MarshalIndent(makeWorkspaces(2), "", "  "))) + "\n",
+		},
+		{
+			name:           "Big Workspace Iterator with template",
+			v:              makeIterator(234),
+			outputFormat:   flags.OutputText,
+			headerTemplate: "id\tname",
+			template:       "{{range .}}{{.WorkspaceId}}\t{{.WorkspaceName}}\n{{end}}",
+			expected:       "id   name\n" + makeBigOutput(234),
+		},
+		{
+			name:         "Big Workspace Iterator with no template",
+			v:            makeIterator(234),
+			outputFormat: flags.OutputText,
+			expected:     string(must(json.MarshalIndent(makeWorkspaces(234), "", "  "))) + "\n",
+		},
+		{
+			name:         "io.Reader",
+			v:            strings.NewReader("a test"),
+			outputFormat: flags.OutputText,
+			expected:     "a test",
+		},
+		{
+			name:         "io.Reader",
+			v:            strings.NewReader("a test"),
+			outputFormat: flags.OutputJSON,
+			errMessage:   "json output not supported",
+		},
+	}
 }
 
 // TestRenderJSONColorGate verifies defaultRenderer.renderJson honors the
@@ -208,8 +214,54 @@ func TestRenderJSONColorGate(t *testing.T) {
 	}
 }
 
+func TestRenderJSONBytes(t *testing.T) {
+	// A >2^53 integer, non-alphabetical keys, and an unescaped '<' that all
+	// survive: RenderJSONBytes must not decode the value (which would round the
+	// integer to a float64, sort the keys, and escape the '<').
+	raw := []byte(`{"job_id":18000000000000000123,"name":"a<b"}`)
+	want := "{\n  \"job_id\": 18000000000000000123,\n  \"name\": \"a<b\"\n}\n"
+
+	ctx, out := NewTestContextWithStdout(t.Context())
+	require.NoError(t, RenderJSONBytes(ctx, raw))
+	assert.Equal(t, want, out.String())
+}
+
+func TestRenderJSONBytesColorGate(t *testing.T) {
+	raw := []byte(`{"n":1}`)
+	for _, tt := range []struct {
+		name        string
+		stdoutIsTTY bool
+		color       bool
+		wantANSI    bool
+	}{
+		{"tty with color", true, true, true},
+		{"no tty with color", false, true, false},
+		{"tty without color", true, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out := &bytes.Buffer{}
+			c := &cmdIO{
+				capabilities: Capabilities{stdoutIsTTY: tt.stdoutIsTTY, color: tt.color},
+				out:          out,
+				err:          out,
+			}
+			require.NoError(t, RenderJSONBytes(InContext(t.Context(), c), raw))
+			if tt.wantANSI {
+				assert.Contains(t, out.String(), "\x1b[")
+			} else {
+				assert.NotContains(t, out.String(), "\x1b[")
+			}
+		})
+	}
+}
+
+func TestRenderJSONBytesInvalid(t *testing.T) {
+	ctx, _ := NewTestContextWithStdout(t.Context())
+	assert.Error(t, RenderJSONBytes(ctx, []byte("not json")))
+}
+
 func TestRender(t *testing.T) {
-	for _, c := range testCases {
+	for _, c := range makeTestCases() {
 		t.Run(c.name, func(t *testing.T) {
 			output := &bytes.Buffer{}
 			ctx := t.Context()

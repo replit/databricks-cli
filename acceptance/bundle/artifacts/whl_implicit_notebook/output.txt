@@ -1,17 +1,9 @@
 
->>> [CLI] bundle deploy
-Building python_artifact...
-Uploading dist/my_test_code-0.0.1-py3-none-any.whl...
-Uploading bundle files to /Workspace/Users/[USERNAME]/.bundle/test-bundle/default/files...
-Deploying resources...
-Updating deployment state...
-Deployment complete!
-
 >>> find.py --expect 1 whl
 dist/my_test_code-0.0.1-py3-none-any.whl
 
 === Expecting 1 wheel in libraries section in /jobs/create
->>> jq -s .[] | select(.path=="/api/2.2/jobs/create") | .body.tasks[0].libraries out.requests.txt
+>>> jq -s .[] | select(.path=="/api/2.2/jobs/create") | .body.tasks[0].libraries [OUTPUT_DIR]/out.requests.txt
 [
   {
     "whl": "/Workspace/Users/[USERNAME]/.bundle/test-bundle/default/artifacts/.internal/my_test_code-0.0.1-py3-none-any.whl"
@@ -19,6 +11,6 @@ dist/my_test_code-0.0.1-py3-none-any.whl
 ]
 
 === Expecting 1 wheel to be uploaded
->>> jq .path
-"/api/2.0/workspace-files/import-file/Workspace/Users/[USERNAME]/.bundle/test-bundle/default/artifacts/.internal/my_test_code-0.0.1-py3-none-any.whl"
-"/api/2.0/workspace-files/import-file/Workspace/Users/[USERNAME]/.bundle/test-bundle/default/files/dist/my_test_code-0.0.1-py3-none-any.whl"
+>>> print_workspace_imports
+/Workspace/Users/[USERNAME]/.bundle/test-bundle/default/artifacts/.internal/my_test_code-0.0.1-py3-none-any.whl
+/Workspace/Users/[USERNAME]/.bundle/test-bundle/default/files/dist/my_test_code-0.0.1-py3-none-any.whl

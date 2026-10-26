@@ -3,12 +3,18 @@ package structpath
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
-
-	"github.com/databricks/cli/libs/dyn"
-	"github.com/databricks/cli/libs/dyn/dynvar"
 )
+
+// baseVarDef matches a path segment of a ${...} reference. It is the grammar of
+// dynvar.BaseVarDef, which structpath cannot import; TestPureReferenceMatchesDynvar
+// keeps them in agreement.
+const baseVarDef = `_*\p{L}+([-_]*[\p{L}\p{N}]+)*`
+
+// pureReference matches a string that is a single ${...} reference.
+var pureReference = regexp.MustCompile(`^\$\{(` + baseVarDef + `(\.` + baseVarDef + `(\[[0-9]+\])*)*(\[[0-9]+\])*)\}$`)
 
 const (
 	// Encodes wildcard after a dot: foo.*
@@ -161,6 +167,28 @@ func NewStringKey(prev *PathNode, fieldName string) *PathNode {
 		return NewDotString(prev, fieldName)
 	}
 	return NewBracketString(prev, fieldName)
+}
+
+// NewPath appends parts to prev: a string is a key (see [NewStringKey]) and an int is
+// an index. Other types panic.
+func NewPath(prev *PathNode, parts ...any) *PathNode {
+	for _, part := range parts {
+		switch v := part.(type) {
+		case string:
+			prev = NewStringKey(prev, v)
+		case int:
+			prev = NewIndex(prev, v)
+		default:
+			panic(fmt.Sprintf("structpath.NewPath: unsupported part %#v", part))
+		}
+	}
+	return prev
+}
+
+// NewPathSlice returns the path of parts from the root (see [NewPath]) as a one-element
+// slice, e.g. for diag.Diagnostic.Paths.
+func NewPathSlice(parts ...any) []*PathNode {
+	return []*PathNode{NewPath(nil, parts...)}
 }
 
 func NewKeyValue(prev *PathNode, key, value string) *PathNode {
@@ -637,6 +665,15 @@ func MustParsePath(s string) *PathNode {
 	return path
 }
 
+// MustParsePaths parses each of paths like [MustParsePath], e.g. for diag.Diagnostic.Paths.
+func MustParsePaths(paths ...string) []*PathNode {
+	out := make([]*PathNode, len(paths))
+	for i, s := range paths {
+		out[i] = MustParsePath(s)
+	}
+	return out
+}
+
 // isReservedFieldChar checks if character is reserved and cannot be used in field names
 func isReservedFieldChar(ch byte) bool {
 	switch ch {
@@ -677,16 +714,12 @@ func isValidField(s string) bool {
 // PureReferenceToPath returns a PathNode if s is a pure variable reference, otherwise false.
 // This function is similar to dynvar.PureReferenceToPath but returns a *PathNode instead of dyn.Path.
 func PureReferenceToPath(s string) (*PathNode, bool) {
-	ref, ok := dynvar.NewRef(dyn.V(s))
-	if !ok {
+	m := pureReference.FindStringSubmatch(s)
+	if m == nil {
 		return nil, false
 	}
 
-	if !ref.IsPure() {
-		return nil, false
-	}
-
-	pattern, err := parse(ref.References()[0], false)
+	pattern, err := parse(m[1], false)
 	if err != nil {
 		return nil, false
 	}
@@ -865,7 +898,8 @@ func (p *PathNode) HasPatternPrefix(prefix *PatternNode) bool {
 }
 
 // nodeMatchesPattern checks if a concrete path node matches a pattern node.
-// Wildcards (.* and [*]) match any node.
+// Wildcards (.* and [*]) match any node. A * inside a bracket map key matches
+// one dot-separated segment; a trailing * matches the remainder of the key.
 func nodeMatchesPattern(concrete *PathNode, pattern *PatternNode) bool {
 	if concrete == nil && pattern == nil {
 		return true
@@ -876,7 +910,35 @@ func nodeMatchesPattern(concrete *PathNode, pattern *PatternNode) bool {
 	if pattern.DotStar() || pattern.BracketStar() {
 		return true
 	}
+	patternKey, patternIsBracket := (*PathNode)(pattern).BracketString()
+	concreteKey, concreteIsBracket := concrete.BracketString()
+	if patternIsBracket && concreteIsBracket && strings.Contains(patternKey, "*") {
+		return matchDotSeparatedGlob(patternKey, concreteKey)
+	}
 	return nodesEqual(concrete, (*PathNode)(pattern))
+}
+
+// matchDotSeparatedGlob matches keys split on '.'. Each '*' consumes exactly one
+// segment unless it is the last pattern segment, in which case it absorbs the
+// remaining segments after the preceding '.'. That suffix must be present (a
+// key ending in '.' has an empty final segment and still matches), so the key
+// needs at least one segment beyond the '*'s position.
+func matchDotSeparatedGlob(pattern, key string) bool {
+	patternParts := strings.Split(pattern, ".")
+	keyParts := strings.Split(key, ".")
+	for i, p := range patternParts {
+		if p == "*" && i == len(patternParts)-1 {
+			return i < len(keyParts) // trailing '*' absorbs a non-empty suffix
+		}
+		if i >= len(keyParts) {
+			return false // pattern still has segments, key ran out
+		}
+		if p != "*" && p != keyParts[i] {
+			return false
+		}
+	}
+	// Pattern exhausted with no trailing '*': the key must be too.
+	return len(patternParts) == len(keyParts)
 }
 
 // MarshalYAML implements yaml.Marshaler for PathNode.

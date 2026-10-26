@@ -8,13 +8,34 @@ Drop in replacement for golangci-lint that runs it only on changed packages.
 Changes are calculated as diff against the merge base with main by default, use --ref or -H/--head to change this.
 """
 
-import os
-import sys
 import argparse
+import os
 import subprocess
+import sys
 
 # Each entry is a path prefix: "tools" also covers "tools/task", "tools/other", etc.
-NESTED_MODULES = ("bundle/internal/tf/codegen", "tools")
+NESTED_MODULES = ("tools",)
+
+
+def in_nested_module(path):
+    """Check if a path is a nested module or lives under one.
+
+    A path matches a module exactly or as a `/`-separated prefix, but a sibling
+    that merely shares a leading substring does not:
+
+    >>> in_nested_module("tools")
+    True
+
+    >>> in_nested_module("tools/task/subtask.go")
+    True
+
+    >>> in_nested_module("cmd/bundle")
+    False
+
+    >>> in_nested_module("toolz")
+    False
+    """
+    return any(path == m or path.startswith(m + "/") for m in NESTED_MODULES)
 
 
 def parse_lines(cmd):
@@ -45,13 +66,11 @@ def main():
     if gitroot:
         os.chdir(gitroot[0])
 
-    # Resolve the merge base between the ref and HEAD so that we only lint
-    # files changed on this branch, not files that changed on the ref since
-    # the branch point.
-    merge_base = parse_lines(["git", "merge-base", args.ref, "HEAD"])
-    base = merge_base[0] if merge_base else args.ref
-
-    changed = parse_lines(["git", "diff", "--name-only", base, "--", "."])
+    # Diff the merge base against the working tree so we only lint files changed
+    # on this branch, not files that advanced on the ref since the branch point.
+    # Unlike testmask's three-dot "ref...HEAD" form (tools/testmask/git.go), this
+    # includes the dirty tree's uncommitted changes, which is the point of --fix.
+    changed = parse_lines(["git", "diff", "--name-only", "--merge-base", args.ref, "--", "."])
 
     cmd = args.args[:]
 
@@ -61,10 +80,6 @@ def main():
     filter_nested = "run" in cmd
 
     if changed is not None:
-
-        def in_nested_module(path):
-            return filter_nested and any(path == m or path.startswith(m + "/") for m in NESTED_MODULES)
-
         # We need to pass packages to golangci-lint, not individual files.
         # QQQ for lint we should also pass all dependent packages
         dirs = set()
@@ -73,7 +88,7 @@ def main():
                 continue
             if filename.endswith(".go"):
                 d = os.path.dirname(filename)
-                if in_nested_module(d):
+                if filter_nested and in_nested_module(d):
                     continue
                 dirs.add(d)
 

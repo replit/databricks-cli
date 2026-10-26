@@ -2,21 +2,16 @@ package configsync
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
-	"io/fs"
-	"os"
-	"path/filepath"
+	"strings"
 
 	"github.com/databricks/cli/bundle"
-	"github.com/databricks/cli/bundle/config/engine"
-	"github.com/databricks/cli/bundle/deploy"
+	"github.com/databricks/cli/bundle/config"
 	"github.com/databricks/cli/bundle/deployplan"
-	"github.com/databricks/cli/bundle/direct"
 	"github.com/databricks/cli/libs/dyn"
 	"github.com/databricks/cli/libs/dyn/convert"
 	"github.com/databricks/cli/libs/log"
+	"github.com/databricks/cli/libs/structs/structdiff"
 )
 
 type OperationType string
@@ -32,6 +27,12 @@ const (
 type ConfigChangeDesc struct {
 	Operation OperationType `json:"operation"`
 	Value     any           `json:"value,omitempty"` // Normalized remote value (nil for remove operations)
+
+	// LocalEdit reports that the local config value for this field differs from
+	// the last-deployed state, so applying this change overwrites a not-yet-
+	// deployed local edit. Telemetry-only; direct engine only (the terraform
+	// sync snapshot has no per-field base). Not part of the command output.
+	LocalEdit bool `json:"-"`
 }
 
 type ResourceChanges map[string]*ConfigChangeDesc
@@ -85,7 +86,12 @@ func filterEntityDefaults(basePath string, value any) any {
 }
 
 func convertChangeDesc(path string, cd *deployplan.ChangeDesc) (*ConfigChangeDesc, error) {
-	hasConfigValue := cd.Old != nil || cd.New != nil
+	// Use cd.New (current config) to decide whether the field exists "on the config side".
+	// cd.Old (saved state) must not be considered: when the user has already synced a rename
+	// locally (cd.New == nil for the old key) but state still holds the prior key, including
+	// cd.Old in this check would classify the change as Replace and fail later in
+	// resolveSelectors because the old key no longer exists in the YAML.
+	hasConfigValue := cd.New != nil
 	normalizedValue, err := normalizeValue(cd.Remote)
 	if err != nil {
 		return nil, fmt.Errorf("failed to normalize remote value: %w", err)
@@ -117,39 +123,41 @@ func convertChangeDesc(path string, cd *deployplan.ChangeDesc) (*ConfigChangeDes
 	}, nil
 }
 
-// DetectChanges compares current remote state with the last deployed state
-// and returns a map of resource changes.
-func DetectChanges(ctx context.Context, b *bundle.Bundle, engine engine.EngineType) (Changes, error) {
+// isPermissionsOrGrantsSubResource reports whether a plan resource key is a
+// permissions or grants sub-resource ("resources.<type>.<name>.permissions" /
+// ".grants"). It classifies the key structurally via config.GetNodeAndType,
+// which keys on the path component (index 3), so a resource literally named
+// "permissions" ("resources.jobs.permissions") is not misclassified.
+func isPermissionsOrGrantsSubResource(resourceKey string) bool {
+	path, err := dyn.NewPathFromString(resourceKey)
+	if err != nil {
+		return false
+	}
+	_, nodeType := config.GetNodeAndType(path)
+	return strings.HasSuffix(nodeType, ".permissions") || strings.HasSuffix(nodeType, ".grants")
+}
+
+// ExtractChanges extracts the map of remote-vs-config changes from a deploy
+// plan.
+func ExtractChanges(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan) (Changes, error) {
 	changes := make(Changes)
 
-	err := ensureSnapshotAvailable(ctx, b, engine)
-	if err != nil {
-		return nil, fmt.Errorf("state snapshot not available: %w", err)
-	}
-
-	var deployBundle *direct.DeploymentBundle
-	if engine.IsDirect() {
-		// For direct engine, state is already opened by the caller (process.go).
-		deployBundle = &b.DeploymentBundle
-	} else {
-		deployBundle = &direct.DeploymentBundle{}
-		_, statePath := b.StateFilenameConfigSnapshot(ctx)
-		if err := deployBundle.StateDB.Open(statePath); err != nil {
-			return nil, fmt.Errorf("failed to open state: %w", err)
-		}
-	}
-
-	plan, err := deployBundle.CalculatePlan(ctx, b.WorkspaceClient(ctx), &b.Config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to calculate plan: %w", err)
-	}
-
 	for resourceKey, entry := range plan.Plan {
+		// permissions and grants are emitted as their own plan keys
+		// ("resources.<type>.<name>.permissions" / ".grants"; see splitResourcePath
+		// in bundle/direct/bundle_plan.go). config-remote-sync cannot write them back
+		// to YAML: their fields (e.g. object_id) are server-populated with no source
+		// location, and bundle-level permissions have no per-resource YAML node at all,
+		// so resolving them would fail the whole sync. Skip them instead.
+		if isPermissionsOrGrantsSubResource(resourceKey) {
+			continue
+		}
+
 		resourceChanges := make(ResourceChanges)
 
 		if entry.Changes != nil {
 			for path, changeDesc := range entry.Changes {
-				if changeDesc.Action == deployplan.Skip {
+				if changeDesc.Action == deployplan.Skip && changeDesc.Reason != deployplan.ReasonRemoteAddition {
 					continue
 				}
 
@@ -160,6 +168,12 @@ func DetectChanges(ctx context.Context, b *bundle.Bundle, engine engine.EngineTy
 				}
 				if change.Operation == OperationSkip {
 					continue
+				}
+				// The state snapshot holds real per-field values, so New != Old
+				// means the local config diverged from the last deploy and this
+				// change overwrites that pending edit.
+				if !structdiff.IsEqual(changeDesc.Old, changeDesc.New) {
+					change.LocalEdit = true
 				}
 				change.Value = stripNamePrefix(fullPath, change.Value, b.Config.Presets.NamePrefix)
 				resourceChanges[path] = change
@@ -174,53 +188,4 @@ func DetectChanges(ctx context.Context, b *bundle.Bundle, engine engine.EngineTy
 	}
 
 	return changes, nil
-}
-
-func ensureSnapshotAvailable(ctx context.Context, b *bundle.Bundle, engine engine.EngineType) error {
-	if engine.IsDirect() {
-		return nil
-	}
-
-	remotePathSnapshot, localPathSnapshot := b.StateFilenameConfigSnapshot(ctx)
-
-	if _, err := os.Stat(localPathSnapshot); err == nil {
-		return nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("checking snapshot file: %w", err)
-	}
-
-	log.Debugf(ctx, "Resources state snapshot not found locally, pulling from remote")
-
-	f, err := deploy.StateFiler(ctx, b)
-	if err != nil {
-		return fmt.Errorf("getting state filer: %w", err)
-	}
-
-	r, err := f.Read(ctx, remotePathSnapshot)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("resources state snapshot not found remotely at %s", remotePathSnapshot)
-		}
-		return fmt.Errorf("reading remote snapshot: %w", err)
-	}
-	defer r.Close()
-
-	content, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("reading snapshot content: %w", err)
-	}
-
-	localStateDir := filepath.Dir(localPathSnapshot)
-	err = os.MkdirAll(localStateDir, 0o700)
-	if err != nil {
-		return fmt.Errorf("creating snapshot directory: %w", err)
-	}
-
-	err = os.WriteFile(localPathSnapshot, content, 0o600)
-	if err != nil {
-		return fmt.Errorf("writing snapshot file: %w", err)
-	}
-
-	log.Debugf(ctx, "Pulled config snapshot from remote to %s", localPathSnapshot)
-	return nil
 }

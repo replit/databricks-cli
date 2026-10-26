@@ -20,6 +20,9 @@ func (s *FakeWorkspace) VolumesCreate(req Request) Response {
 		}
 	}
 
+	// UC normalizes schema and volume names to lowercase.
+	volume.SchemaName = strings.ToLower(volume.SchemaName)
+	volume.Name = strings.ToLower(volume.Name)
 	volume.FullName = volume.CatalogName + "." + volume.SchemaName + "." + volume.Name
 
 	if volume.StorageLocation != "" && volume.VolumeType != catalog.VolumeTypeExternal {
@@ -73,6 +76,11 @@ func (s *FakeWorkspace) VolumesUpdate(req Request, fullname string) Response {
 		}
 	}
 
+	fields, errResponse := parseUCUpdate(req.Body, "UpdateVolume")
+	if errResponse != nil {
+		return *errResponse
+	}
+
 	var request catalog.UpdateVolumeRequestContent
 
 	if err := json.Unmarshal(req.Body, &request); err != nil {
@@ -82,13 +90,7 @@ func (s *FakeWorkspace) VolumesUpdate(req Request, fullname string) Response {
 		}
 	}
 
-	if request.Comment != "" {
-		existing.Comment = request.Comment
-	}
-
-	if request.Owner != "" {
-		existing.Owner = request.Owner
-	}
+	applyUpdatedFields(&existing, request, fields)
 
 	if request.NewName != "" {
 		delete(s.Volumes, fullname)

@@ -14,6 +14,7 @@ import (
 	"github.com/databricks/cli/bundle/config/resources"
 	"github.com/databricks/cli/bundle/config/variable"
 	"github.com/databricks/cli/bundle/internal/bundletest"
+	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/cli/libs/dyn"
 	"github.com/databricks/cli/libs/vfs"
 	"github.com/databricks/databricks-sdk-go/service/compute"
@@ -29,6 +30,15 @@ func touchNotebookFile(t *testing.T, path string) {
 	_, err = f.WriteString("# Databricks notebook source\n")
 	require.NoError(t, err)
 	f.Close()
+}
+
+// touchDesignerFile writes a minimal valid Lakeflow Designer notebook (Jupyter
+// JSON) so that notebook.DetectWithFS recognizes it as a notebook.
+func touchDesignerFile(t *testing.T, path string) {
+	err := os.MkdirAll(filepath.Dir(path), 0o700)
+	require.NoError(t, err)
+	contents := `{"cells":[],"metadata":{"application/vnd.databricks.v1+notebook":{"language":"python"}},"nbformat":4,"nbformat_minor":0}`
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
 }
 
 func touchEmptyFile(t *testing.T, path string) {
@@ -84,7 +94,7 @@ func TestTranslatePathsSkippedWithGitSource(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	require.NoError(t, diags.Error())
@@ -213,7 +223,7 @@ func TestTranslatePaths(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	require.NoError(t, diags.Error())
@@ -356,8 +366,8 @@ func TestTranslatePathsInSubdirectories(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, "resources.jobs", []dyn.Location{{File: filepath.Join(dir, "job/resource.yml")}})
-	bundletest.SetLocation(b, "resources.pipelines", []dyn.Location{{File: filepath.Join(dir, "pipeline/resource.yml")}})
+	bundletest.SetLocation(b, "resources.jobs", []diag.Location{{File: filepath.Join(dir, "job/resource.yml")}})
+	bundletest.SetLocation(b, "resources.pipelines", []diag.Location{{File: filepath.Join(dir, "pipeline/resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	require.NoError(t, diags.Error())
@@ -424,7 +434,7 @@ func TestTranslatePathsOutsideSyncRoot(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "../resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "../resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.ErrorContains(t, diags.Error(), "is not contained in sync root path")
@@ -456,7 +466,7 @@ func TestJobNotebookDoesNotExistError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "fake.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "fake.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.EqualError(t, diags.Error(), "notebook doesnt_exist.py not found")
@@ -488,7 +498,7 @@ func TestJobFileDoesNotExistError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "fake.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "fake.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.EqualError(t, diags.Error(), "file doesnt_exist.py not found")
@@ -520,7 +530,7 @@ func TestPipelineNotebookDoesNotExistError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "fake.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "fake.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.EqualError(t, diags.Error(), "notebook doesnt_exist.py not found")
@@ -565,7 +575,7 @@ func TestPipelineNotebookDoesNotExistErrorWithoutExtension(t *testing.T) {
 				},
 			}
 
-			bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "fake.yml")}})
+			bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "fake.yml")}})
 			diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 
 			if ext == "" {
@@ -606,7 +616,7 @@ func TestPipelineFileDoesNotExistError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "fake.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "fake.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.EqualError(t, diags.Error(), "file doesnt_exist.py not found")
@@ -642,7 +652,7 @@ func TestJobSparkPythonTaskWithNotebookSourceError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.ErrorContains(t, diags.Error(), `expected a file for "resources.jobs.job.tasks[0].spark_python_task.python_file" but got a notebook`)
@@ -678,7 +688,7 @@ func TestJobNotebookTaskWithFileSourceError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.ErrorContains(t, diags.Error(), `expected a notebook for "resources.jobs.job.tasks[0].notebook_task.notebook_path" but got a file`)
@@ -714,7 +724,7 @@ func TestPipelineNotebookLibraryWithFileSourceError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.ErrorContains(t, diags.Error(), `expected a notebook for "resources.pipelines.pipeline.libraries[0].notebook.path" but got a file`)
@@ -750,7 +760,7 @@ func TestPipelineFileLibraryWithNotebookSourceError(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	assert.ErrorContains(t, diags.Error(), `expected a file for "resources.pipelines.pipeline.libraries[0].file.path" but got a notebook`)
@@ -792,7 +802,7 @@ func TestTranslatePathJobEnvironments(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, "resources.jobs", []dyn.Location{{File: filepath.Join(dir, "job/resource.yml")}})
+	bundletest.SetLocation(b, "resources.jobs", []diag.Location{{File: filepath.Join(dir, "job/resource.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	require.NoError(t, diags.Error())
@@ -839,8 +849,8 @@ func TestTranslatePathWithComplexVariables(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, "variables", []dyn.Location{{File: filepath.Join(dir, "variables/variables.yml")}})
-	bundletest.SetLocation(b, "resources.jobs", []dyn.Location{{File: filepath.Join(dir, "job/resource.yml")}})
+	bundletest.SetLocation(b, "variables", []diag.Location{{File: filepath.Join(dir, "variables/variables.yml")}})
+	bundletest.SetLocation(b, "resources.jobs", []diag.Location{{File: filepath.Join(dir, "job/resource.yml")}})
 
 	ctx := t.Context()
 	// Assign the variables to the dynamic configuration.
@@ -968,7 +978,7 @@ func TestTranslatePathsWithSourceLinkedDeployment(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "resource.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "resource.yml")}})
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	require.NoError(t, diags.Error())
 
@@ -1076,7 +1086,7 @@ func TestTranslatePathsWithSkipLocalFileValidation(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "databricks.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "databricks.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	require.NoError(t, diags.Error())
@@ -1116,11 +1126,118 @@ func TestTranslatePathsWithSkipLocalFileValidationDirectory(t *testing.T) {
 		},
 	}
 
-	bundletest.SetLocation(b, ".", []dyn.Location{{File: filepath.Join(dir, "databricks.yml")}})
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "databricks.yml")}})
 
 	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
 	require.NoError(t, diags.Error())
 
 	// Directory path should be translated even though directory doesn't exist.
 	assert.Equal(t, "/bundle/pipeline_root", b.Config.Resources.Pipelines["pipeline"].RootPath)
+}
+
+// TestTranslatePathsDesignerNotebook verifies that Lakeflow Designer notebooks
+// (`*.designer.ipynb`) referenced by a notebook_task preserve their full
+// suffix in the deployed notebook_path, since the workspace keeps that suffix
+// on import (unlike regular `.ipynb`, which is stripped).
+func TestTranslatePathsDesignerNotebook(t *testing.T) {
+	dir := t.TempDir()
+	touchDesignerFile(t, filepath.Join(dir, "src", "designer.designer.ipynb"))
+	touchNotebookFile(t, filepath.Join(dir, "src", "regular.py"))
+
+	b := &bundle.Bundle{
+		SyncRootPath:   dir,
+		BundleRootPath: dir,
+		SyncRoot:       vfs.MustNew(dir),
+		Config: config.Root{
+			Workspace: config.Workspace{
+				FilePath: "/bundle",
+			},
+			Resources: config.Resources{
+				Jobs: map[string]*resources.Job{
+					"job": {
+						JobSettings: jobs.JobSettings{
+							Tasks: []jobs.Task{
+								{
+									NotebookTask: &jobs.NotebookTask{
+										NotebookPath: "./src/designer.designer.ipynb",
+									},
+								},
+								{
+									NotebookTask: &jobs.NotebookTask{
+										NotebookPath: "./src/regular.py",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "databricks.yml")}})
+
+	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
+	require.NoError(t, diags.Error())
+
+	// Designer notebook keeps its full ".designer.ipynb" suffix.
+	assert.Equal(t,
+		"/bundle/src/designer.designer.ipynb",
+		b.Config.Resources.Jobs["job"].Tasks[0].NotebookTask.NotebookPath)
+
+	// Regular notebook still has its extension stripped on import.
+	assert.Equal(t,
+		"/bundle/src/regular",
+		b.Config.Resources.Jobs["job"].Tasks[1].NotebookTask.NotebookPath)
+}
+
+// TestTranslatePathsDesignerNotebookSkipLocalFileValidation verifies the
+// designer-suffix preservation also holds on the config-remote-sync code path
+// where the local file is not inspected.
+func TestTranslatePathsDesignerNotebookSkipLocalFileValidation(t *testing.T) {
+	dir := t.TempDir()
+
+	b := &bundle.Bundle{
+		SyncRootPath:            dir,
+		BundleRootPath:          dir,
+		SyncRoot:                vfs.MustNew(dir),
+		SkipLocalFileValidation: true,
+		Config: config.Root{
+			Workspace: config.Workspace{
+				FilePath: "/bundle",
+			},
+			Resources: config.Resources{
+				Jobs: map[string]*resources.Job{
+					"job": {
+						JobSettings: jobs.JobSettings{
+							Tasks: []jobs.Task{
+								{
+									NotebookTask: &jobs.NotebookTask{
+										NotebookPath: "./src/designer.designer.ipynb",
+									},
+								},
+								{
+									NotebookTask: &jobs.NotebookTask{
+										NotebookPath: "./src/regular.ipynb",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	bundletest.SetLocation(b, ".", []diag.Location{{File: filepath.Join(dir, "databricks.yml")}})
+
+	diags := bundle.ApplySeq(t.Context(), b, mutator.NormalizePaths(), mutator.TranslatePaths())
+	require.NoError(t, diags.Error())
+
+	assert.Equal(t,
+		"/bundle/src/designer.designer.ipynb",
+		b.Config.Resources.Jobs["job"].Tasks[0].NotebookTask.NotebookPath)
+	assert.Equal(t,
+		"/bundle/src/regular",
+		b.Config.Resources.Jobs["job"].Tasks[1].NotebookTask.NotebookPath)
 }

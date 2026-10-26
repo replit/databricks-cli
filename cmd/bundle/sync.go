@@ -20,7 +20,6 @@ type syncFlags struct {
 	interval     time.Duration
 	full         bool
 	watch        bool
-	output       flags.Output
 	dryRun       bool
 	concurrency  int
 	retryTimeout time.Duration
@@ -32,18 +31,16 @@ func (f *syncFlags) syncOptionsFromBundle(cmd *cobra.Command, b *bundle.Bundle) 
 		return nil, fmt.Errorf("cannot get sync options: %w", err)
 	}
 
-	if f.output != "" {
-		var outputFunc func(context.Context, <-chan sync.Event, io.Writer)
-		switch f.output {
-		case flags.OutputText:
-			outputFunc = sync.TextOutput
-		case flags.OutputJSON:
-			outputFunc = sync.JsonOutput
-		}
-		if outputFunc != nil {
-			opts.OutputHandler = func(ctx context.Context, c <-chan sync.Event) {
-				outputFunc(ctx, c, cmd.OutOrStdout())
-			}
+	var outputFunc func(context.Context, <-chan sync.Event, io.Writer)
+	switch root.OutputType(cmd) {
+	case flags.OutputText:
+		outputFunc = sync.TextOutput
+	case flags.OutputJSON:
+		outputFunc = sync.JsonOutput
+	}
+	if outputFunc != nil {
+		opts.OutputHandler = func(ctx context.Context, c <-chan sync.Event) {
+			outputFunc(ctx, c, cmd.OutOrStdout())
 		}
 	}
 
@@ -76,7 +73,6 @@ Use 'databricks bundle deploy' for full resource deployment.`,
 	cmd.Flags().DurationVar(&f.interval, "interval", 1*time.Second, "file system polling interval (for --watch)")
 	cmd.Flags().BoolVar(&f.full, "full", false, "perform full synchronization (default is incremental)")
 	cmd.Flags().BoolVar(&f.watch, "watch", false, "watch local file system for changes")
-	cmd.Flags().Var(&f.output, "output", "type of the output format")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "simulate sync execution without making actual changes")
 	cmd.Flags().IntVar(&f.concurrency, "concurrency", 5, "maximum number of concurrent in-flight requests during sync")
 	cmd.Flags().DurationVar(&f.retryTimeout, "retry-timeout", sync.DefaultRetryTimeout, "per-call deadline for retrying transient gateway errors (HTTP 502/503/504)")

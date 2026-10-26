@@ -1,4 +1,4 @@
-Local = true
+Cloud = true
 CloudSlow = true
 
 # Workspace file system does not allow initializing python envs on it.
@@ -26,3 +26,7 @@ Ignore = [
     "python_wheel_wrapper.yml",
     "empty.yml",
 ]
+
+[[Repls]]
+Old = '/runs/\d+'
+New = '/runs/[RUN_ID]'

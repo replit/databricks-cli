@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/cli/libs/dyn"
 	"github.com/databricks/cli/libs/dyn/dynvar"
+	"github.com/databricks/cli/libs/structs/structpath"
 	"github.com/databricks/databricks-sdk-go/marshal"
 	"github.com/databricks/databricks-sdk-go/service/sql"
 )
@@ -63,7 +65,7 @@ func (m *loadDBAlertFiles) Apply(ctx context.Context, b *bundle.Bundle) diag.Dia
 		// No other fields other than allowedInYAML should be set in the bundle YAML.
 		m, ok := alertV.AsMap()
 		if !ok {
-			return diag.FromErr(fmt.Errorf("internal error: alert value is not a map: %w", err))
+			return diag.FromErr(fmt.Errorf("internal error: alert value is not a map, got %s", alertV.Kind()))
 		}
 
 		for _, p := range m.Pairs() {
@@ -84,13 +86,21 @@ func (m *loadDBAlertFiles) Apply(ctx context.Context, b *bundle.Bundle) diag.Dia
 					Severity:  diag.Error,
 					Summary:   fmt.Sprintf("field %s is not allowed in the bundle configuration.", k),
 					Detail:    "When a .dbalert.json is specified, only the following fields are allowed in the bundle configuration: " + strings.Join(allowedInYAML, ", "),
-					Paths:     []dyn.Path{dyn.MustPathFromString(fmt.Sprintf("resources.alerts.%s.%s", alertKey, k))},
+					Paths:     structpath.NewPathSlice("resources", "alerts", alertKey, k),
 					Locations: v.Locations(),
 				},
 			}
 		}
 
-		content, err := os.ReadFile(alert.FilePath)
+		// NormalizePaths rewrote file_path to be relative to the bundle root, but the
+		// process working directory can be any directory within the bundle, so anchor
+		// the read to the bundle root. Absolute paths are kept as-is by NormalizePaths.
+		filePath := alert.FilePath
+		if !filepath.IsAbs(filePath) {
+			filePath = filepath.Join(b.BundleRootPath, filePath)
+		}
+
+		content, err := os.ReadFile(filePath)
 		if err != nil {
 			return diag.Diagnostics{
 				{
@@ -98,7 +108,7 @@ func (m *loadDBAlertFiles) Apply(ctx context.Context, b *bundle.Bundle) diag.Dia
 					Severity:  diag.Error,
 					Summary:   fmt.Sprintf("failed to read .dbalert.json file %s: %s", alert.FilePath, err),
 					Detail:    "",
-					Paths:     []dyn.Path{dyn.MustPathFromString(fmt.Sprintf("resources.alerts.%s.file_path", alertKey))},
+					Paths:     structpath.NewPathSlice("resources", "alerts", alertKey, "file_path"),
 					Locations: alertV.Get("file_path").Locations(),
 				},
 			}
@@ -113,7 +123,7 @@ func (m *loadDBAlertFiles) Apply(ctx context.Context, b *bundle.Bundle) diag.Dia
 					Severity:  diag.Error,
 					Summary:   fmt.Sprintf("failed to parse .dbalert.json file %s: %s", alert.FilePath, err),
 					Detail:    "",
-					Paths:     []dyn.Path{dyn.MustPathFromString(fmt.Sprintf("resources.alerts.%s.file_path", alertKey))},
+					Paths:     structpath.NewPathSlice("resources", "alerts", alertKey, "file_path"),
 					Locations: alertV.Get("file_path").Locations(),
 				},
 			}
@@ -127,7 +137,7 @@ func (m *loadDBAlertFiles) Apply(ctx context.Context, b *bundle.Bundle) diag.Dia
 					Severity:  diag.Error,
 					Summary:   fmt.Sprintf(".alert file %s must not contain variable interpolations.", alert.FilePath),
 					Detail:    "Please inline the alert configuration in the bundle configuration to use variables",
-					Paths:     []dyn.Path{dyn.MustPathFromString(fmt.Sprintf("resources.alerts.%s.file_path", alertKey))},
+					Paths:     structpath.NewPathSlice("resources", "alerts", alertKey, "file_path"),
 					Locations: alertV.Get("file_path").Locations(),
 				},
 			}
@@ -163,13 +173,15 @@ func (m *loadDBAlertFiles) Apply(ctx context.Context, b *bundle.Bundle) diag.Dia
 			WarehouseId: alert.WarehouseId,
 
 			// Fields with the same schema in file vs API.
-			CustomSummary:  dbalertFromFile.CustomSummary,
-			Schedule:       dbalertFromFile.Schedule,
-			Evaluation:     dbalertFromFile.Evaluation,
-			EffectiveRunAs: dbalertFromFile.EffectiveRunAs,
-			RunAs:          dbalertFromFile.RunAs,
-			RunAsUserName:  dbalertFromFile.RunAsUserName,
-			ParentPath:     dbalertFromFile.ParentPath,
+			CustomSummary:        dbalertFromFile.CustomSummary,
+			Schedule:             dbalertFromFile.Schedule,
+			Evaluation:           dbalertFromFile.Evaluation,
+			EffectiveRunAs:       dbalertFromFile.EffectiveRunAs,
+			RunAs:                dbalertFromFile.RunAs,
+			RunAsUserName:        dbalertFromFile.RunAsUserName,
+			ParentPath:           dbalertFromFile.ParentPath,
+			Parameters:           dbalertFromFile.Parameters,
+			CustomTemplateFormat: dbalertFromFile.CustomTemplateFormat,
 
 			// Output only fields.
 			CreateTime:     dbalertFromFile.CreateTime,

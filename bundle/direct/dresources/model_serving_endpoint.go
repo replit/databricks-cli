@@ -9,6 +9,7 @@ import (
 	"github.com/databricks/cli/libs/structs/structpath"
 	"github.com/databricks/cli/libs/utils"
 	"github.com/databricks/databricks-sdk-go"
+	"github.com/databricks/databricks-sdk-go/marshal"
 	"github.com/databricks/databricks-sdk-go/service/serving"
 )
 
@@ -18,6 +19,7 @@ var (
 	pathAiGateway          = structpath.MustParsePath("ai_gateway")
 	pathConfig             = structpath.MustParsePath("config")
 	pathEmailNotifications = structpath.MustParsePath("email_notifications")
+	pathTelemetryConfig    = structpath.MustParsePath("telemetry_config")
 )
 
 type ResourceModelServingEndpoint struct {
@@ -34,6 +36,11 @@ func (*ResourceModelServingEndpoint) PrepareState(input *resources.ModelServingE
 	return &input.CreateServingEndpoint
 }
 
+// AutoCaptureConfig is the legacy inference-table API; the recommended replacement
+// is AI Gateway inference tables. Bundles still expose it, so the conversion has to
+// keep working until users have migrated.
+//
+//nolint:staticcheck // SA1019: deprecated AutoCaptureConfig{Input,Output} kept for bundle config compatibility
 func autoCaptureConfigOutputToInput(output *serving.AutoCaptureConfigOutput) *serving.AutoCaptureConfigInput {
 	if output == nil {
 		return nil
@@ -87,19 +94,17 @@ func configOutputToInput(output *serving.EndpointCoreConfigOutput) *serving.Endp
 }
 
 func (*ResourceModelServingEndpoint) RemapState(state *ModelServingEndpointRemote) *serving.CreateServingEndpoint {
-	details := state.EndpointDetails
-	// Map the remote state (ServingEndpointDetailed) to the local state (CreateServingEndpoint)
-	// for proper comparison during diff calculation
 	return &serving.CreateServingEndpoint{
-		AiGateway:          details.AiGateway,
-		BudgetPolicyId:     details.BudgetPolicyId,
-		Config:             configOutputToInput(details.Config),
-		Description:        details.Description,
-		EmailNotifications: details.EmailNotifications,
-		Name:               details.Name,
-		RouteOptimized:     details.RouteOptimized,
-		Tags:               details.Tags,
-		ForceSendFields:    utils.FilterFields[serving.CreateServingEndpoint](details.ForceSendFields),
+		AiGateway:          state.AiGateway,
+		BudgetPolicyId:     state.BudgetPolicyId,
+		Config:             state.Config,
+		Description:        state.Description,
+		EmailNotifications: state.EmailNotifications,
+		Name:               state.Name,
+		RouteOptimized:     state.RouteOptimized,
+		Tags:               state.Tags,
+		TelemetryConfig:    state.TelemetryConfig,
+		ForceSendFields:    utils.FilterFields[serving.CreateServingEndpoint](state.ForceSendFields),
 
 		// Rate limits are a deprecated field that are not returned by the API on GET calls. Thus we map them to nil.
 		// TODO(shreyas): Add a warning when users try setting top level rate limits.
@@ -110,6 +115,49 @@ func (*ResourceModelServingEndpoint) RemapState(state *ModelServingEndpointRemot
 type ModelServingEndpointRemote struct {
 	EndpointDetails *serving.ServingEndpointDetailed `json:"endpoint_details"`
 	EndpointId      string                           `json:"endpoint_id"`
+
+	// Fields mapped from EndpointDetails in DoRead so that RemapState is a direct copy
+	// and these fields participate in normal drift detection.
+	AiGateway          *serving.AiGatewayConfig         `json:"ai_gateway,omitempty"`
+	BudgetPolicyId     string                           `json:"budget_policy_id,omitempty"`
+	Config             *serving.EndpointCoreConfigInput `json:"config,omitempty"`
+	Description        string                           `json:"description,omitempty"`
+	EmailNotifications *serving.EmailNotifications      `json:"email_notifications,omitempty"`
+	Name               string                           `json:"name,omitempty"`
+	RouteOptimized     bool                             `json:"route_optimized,omitempty"`
+	Tags               []serving.EndpointTag            `json:"tags,omitempty"`
+	TelemetryConfig    *serving.TelemetryConfig         `json:"telemetry_config,omitempty"`
+
+	// ForceSendFields surfaces EndpointDetails.ForceSendFields at the root so RemapState is a
+	// plain field copy rather than reaching into the nested EndpointDetails struct.
+	ForceSendFields []string `json:"-"`
+}
+
+// Custom marshalers so the SDK's ForceSendFields convention is honored on the wrapper and its
+// extra fields survive a JSON state round-trip (mirrors VectorSearchEndpointRemote).
+func (s *ModelServingEndpointRemote) UnmarshalJSON(b []byte) error {
+	return marshal.Unmarshal(b, s)
+}
+
+func (s ModelServingEndpointRemote) MarshalJSON() ([]byte, error) {
+	return marshal.Marshal(s)
+}
+
+func newModelServingEndpointRemote(details *serving.ServingEndpointDetailed) *ModelServingEndpointRemote {
+	return &ModelServingEndpointRemote{
+		EndpointDetails:    details,
+		EndpointId:         details.Id,
+		AiGateway:          details.AiGateway,
+		BudgetPolicyId:     details.BudgetPolicyId,
+		Config:             configOutputToInput(details.Config),
+		Description:        details.Description,
+		EmailNotifications: details.EmailNotifications,
+		Name:               details.Name,
+		RouteOptimized:     details.RouteOptimized,
+		Tags:               details.Tags,
+		TelemetryConfig:    details.TelemetryConfig,
+		ForceSendFields:    utils.FilterFields[ModelServingEndpointRemote](details.ForceSendFields),
+	}
 }
 
 func (r *ResourceModelServingEndpoint) DoRead(ctx context.Context, id string) (*ModelServingEndpointRemote, error) {
@@ -117,10 +165,7 @@ func (r *ResourceModelServingEndpoint) DoRead(ctx context.Context, id string) (*
 	if err != nil {
 		return nil, err
 	}
-	return &ModelServingEndpointRemote{
-		EndpointDetails: endpoint,
-		EndpointId:      endpoint.Id,
-	}, nil
+	return newModelServingEndpointRemote(endpoint), nil
 }
 
 func (r *ResourceModelServingEndpoint) DoCreate(ctx context.Context, config *serving.CreateServingEndpoint) (string, *ModelServingEndpointRemote, error) {
@@ -138,18 +183,14 @@ func (r *ResourceModelServingEndpoint) waitForEndpointReady(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-
-	return &ModelServingEndpointRemote{
-		EndpointDetails: details,
-		EndpointId:      details.Id,
-	}, nil
+	return newModelServingEndpointRemote(details), nil
 }
 
-func (r *ResourceModelServingEndpoint) WaitAfterCreate(ctx context.Context, config *serving.CreateServingEndpoint) (*ModelServingEndpointRemote, error) {
+func (r *ResourceModelServingEndpoint) WaitAfterCreate(ctx context.Context, id string, config *serving.CreateServingEndpoint) (*ModelServingEndpointRemote, error) {
 	return r.waitForEndpointReady(ctx, config.Name)
 }
 
-func (r *ResourceModelServingEndpoint) WaitAfterUpdate(ctx context.Context, config *serving.CreateServingEndpoint) (*ModelServingEndpointRemote, error) {
+func (r *ResourceModelServingEndpoint) WaitAfterUpdate(ctx context.Context, id string, config *serving.CreateServingEndpoint) (*ModelServingEndpointRemote, error) {
 	return r.waitForEndpointReady(ctx, config.Name)
 }
 
@@ -218,6 +259,19 @@ func (r *ResourceModelServingEndpoint) updateNotifications(ctx context.Context, 
 	_, err := r.client.ServingEndpoints.UpdateNotifications(ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to update notifications: %w", err)
+	}
+	return nil
+}
+
+// updateTelemetryConfig removes telemetry when telemetryConfig is nil.
+func (r *ResourceModelServingEndpoint) updateTelemetryConfig(ctx context.Context, id string, telemetryConfig *serving.TelemetryConfig) error {
+	req := serving.PatchTelemetryConfigRequest{
+		Name:            id,
+		TelemetryConfig: telemetryConfig,
+	}
+	_, err := r.client.ServingEndpoints.PatchTelemetryConfig(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to update telemetry config: %w", err)
 	}
 	return nil
 }
@@ -319,9 +373,22 @@ func (r *ResourceModelServingEndpoint) DoUpdate(ctx context.Context, id string, 
 		}
 	}
 
+	if entry.Changes.HasChange(pathTelemetryConfig) {
+		// The telemetry API rejects endpoints with an update in progress.
+		_, err = r.waitForEndpointReady(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+
+		err = r.updateTelemetryConfig(ctx, id, config.TelemetryConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return nil, nil
 }
 
-func (r *ResourceModelServingEndpoint) DoDelete(ctx context.Context, id string) error {
+func (r *ResourceModelServingEndpoint) DoDelete(ctx context.Context, id string, _ *serving.CreateServingEndpoint) error {
 	return r.client.ServingEndpoints.DeleteByName(ctx, id)
 }

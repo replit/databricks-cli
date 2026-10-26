@@ -10,8 +10,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Default maximum number of concurrent requests during sync. Override with
-// SyncOptions.Concurrency.
+// Default maximum number of concurrent requests during sync (override with
+// SyncOptions.Concurrency). Chosen against the
+// per-endpoint rate limits documented at
+// https://docs.databricks.com/aws/en/resources/limits ("API rate limits" -
+// Workspace API), which sync stays within for the endpoints it calls.
 const MaxRequestsInFlight = 20
 
 // Delete the specified path.
@@ -69,13 +72,6 @@ func (s *Sync) applyMkdir(ctx context.Context, localName string) error {
 // Perform a PUT of the specified local path.
 func (s *Sync) applyPut(ctx context.Context, localName string) error {
 	s.notifyProgress(ctx, EventActionPut, localName, 0.0)
-
-	// Surface a missing/unreadable local file even on dry-run.
-	f, err := s.LocalRoot.Open(localName)
-	if err != nil {
-		return err
-	}
-	f.Close()
 
 	if !s.DryRun {
 		opts := []filer.WriteMode{filer.CreateParentDirectories, filer.OverwriteIfExists}

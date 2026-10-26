@@ -24,6 +24,7 @@ type JobRemote struct {
 	EffectiveUsagePolicyId  string                  `json:"effective_usage_policy_id,omitempty"`
 	JobId                   int64                   `json:"job_id,omitempty"`
 	RunAsUserName           string                  `json:"run_as_user_name,omitempty"`
+	TriggerDetails          []jobs.TriggerDetails   `json:"trigger_details,omitempty"`
 	TriggerState            *jobs.TriggerStateProto `json:"trigger_state,omitempty"`
 }
 
@@ -75,8 +76,29 @@ func getDependsOnTaskKey(x jobs.TaskDependency) (string, string) {
 	return "task_key", x.TaskKey
 }
 
+func getWebhookKey(x jobs.Webhook) (string, string) {
+	return "id", x.Id
+}
+
+// The Jobs API returns webhook_notifications.on_* in an arbitrary order, so
+// diff them by id to avoid a phantom diff that never converges.
+var webhookNotificationEvents = []string{
+	"on_start",
+	"on_success",
+	"on_failure",
+	"on_duration_warning_threshold_exceeded",
+	"on_streaming_backlog_exceeded",
+}
+
+// webhook_notifications appears at the job, task, and for_each task levels.
+var webhookNotificationParents = []string{
+	"webhook_notifications",
+	"tasks[*].webhook_notifications",
+	"tasks[*].for_each_task.task.webhook_notifications",
+}
+
 func (*ResourceJob) KeyedSlices() map[string]any {
-	return map[string]any{
+	result := map[string]any{
 		"tasks":                                  getTaskKey,
 		"parameters":                             getParameterName,
 		"job_clusters":                           getJobClusterKey,
@@ -84,6 +106,12 @@ func (*ResourceJob) KeyedSlices() map[string]any {
 		"tasks[*].depends_on":                    getDependsOnTaskKey,
 		"tasks[*].for_each_task.task.depends_on": getDependsOnTaskKey,
 	}
+	for _, parent := range webhookNotificationParents {
+		for _, event := range webhookNotificationEvents {
+			result[parent+"."+event] = getWebhookKey
+		}
+	}
+	return result
 }
 
 func (r *ResourceJob) DoRead(ctx context.Context, id string) (*JobRemote, error) {
@@ -94,9 +122,10 @@ func (r *ResourceJob) DoRead(ctx context.Context, id string) (*JobRemote, error)
 	// GetByJobId only fetches the first page (100 tasks). Jobs.Get handles
 	// pagination and returns the complete job with all tasks merged.
 	job, err := r.client.Jobs.Get(ctx, jobs.GetJobRequest{
-		JobId:           idInt,
-		PageToken:       "",
-		ForceSendFields: nil,
+		JobId:               idInt,
+		PageToken:           "",
+		IncludeTriggerState: false,
+		ForceSendFields:     nil,
 	})
 	if err != nil {
 		return nil, err
@@ -117,6 +146,7 @@ func makeJobRemote(job *jobs.Job) *JobRemote {
 		EffectiveUsagePolicyId:  job.EffectiveUsagePolicyId,
 		JobId:                   job.JobId,
 		RunAsUserName:           job.RunAsUserName,
+		TriggerDetails:          job.TriggerDetails,
 		TriggerState:            job.TriggerState,
 	}
 }
@@ -141,7 +171,7 @@ func (r *ResourceJob) DoUpdate(ctx context.Context, id string, config *jobs.JobS
 	return nil, r.client.Jobs.Reset(ctx, request)
 }
 
-func (r *ResourceJob) DoDelete(ctx context.Context, id string) error {
+func (r *ResourceJob) DoDelete(ctx context.Context, id string, _ *jobs.JobSettings) error {
 	idInt, err := parseJobID(id)
 	if err != nil {
 		return err
@@ -158,8 +188,10 @@ func makeCreateJob(config jobs.JobSettings) (jobs.CreateJob, error) {
 		Continuous:           config.Continuous,
 		Deployment:           config.Deployment,
 		Description:          config.Description,
+		DurationTarget:       config.DurationTarget,
 		EditMode:             config.EditMode,
 		EmailNotifications:   config.EmailNotifications,
+		EnvironmentVariables: config.EnvironmentVariables,
 		Environments:         config.Environments,
 		Format:               config.Format,
 		GitSource:            config.GitSource,
@@ -169,6 +201,7 @@ func makeCreateJob(config jobs.JobSettings) (jobs.CreateJob, error) {
 		Name:                 config.Name,
 		NotificationSettings: config.NotificationSettings,
 		Parameters:           config.Parameters,
+		ParentPath:           config.ParentPath,
 		PerformanceTarget:    config.PerformanceTarget,
 		Queue:                config.Queue,
 		RunAs:                config.RunAs,
@@ -177,6 +210,7 @@ func makeCreateJob(config jobs.JobSettings) (jobs.CreateJob, error) {
 		Tasks:                config.Tasks,
 		TimeoutSeconds:       config.TimeoutSeconds,
 		Trigger:              config.Trigger,
+		Triggers:             config.Triggers,
 		UsagePolicyId:        config.UsagePolicyId,
 		WebhookNotifications: config.WebhookNotifications,
 		ForceSendFields:      utils.FilterFields[jobs.CreateJob](config.ForceSendFields, "AccessControlList"),

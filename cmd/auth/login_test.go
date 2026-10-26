@@ -15,22 +15,59 @@ import (
 	"time"
 
 	"github.com/databricks/cli/libs/auth"
+	"github.com/databricks/cli/libs/auth/storage"
+	"github.com/databricks/cli/libs/auth/u2m"
 	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/databrickscfg/profile"
 	"github.com/databricks/cli/libs/env"
 	"github.com/databricks/cli/libs/log"
-	"github.com/databricks/databricks-sdk-go/credentials/u2m"
-	"github.com/databricks/databricks-sdk-go/credentials/u2m/cache"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 )
 
-// newTestTokenCache returns an in-memory token cache for tests so that
+// newTestStore returns an in-memory token cache for tests so that
 // discoveryLogin and other login helpers don't touch ~/.databricks/token-cache.json.
-func newTestTokenCache() cache.TokenCache {
-	return &inMemoryTokenCache{Tokens: map[string]*oauth2.Token{}}
+func newTestStore() storage.Store {
+	return &inMemoryStore{Tokens: map[string]*oauth2.Token{}}
+}
+
+type putErrorStore struct {
+	storage.Store
+	err error
+}
+
+func (s *putErrorStore) Put(string, storage.Entry) error {
+	return s.err
+}
+
+type countingStore struct {
+	storage.Store
+	putCalls int
+}
+
+func (s *countingStore) Put(key string, entry storage.Entry) error {
+	s.putCalls++
+	return s.Store.Put(key, entry)
+}
+
+func TestStoreLoginTokenDeletesStaleTokenOnFailure(t *testing.T) {
+	const profileName = "TEST"
+	inner := storage.NewMemoryStore()
+	require.NoError(t, inner.Put(profileName, storage.Entry{
+		Token: &oauth2.Token{AccessToken: "old-token"},
+	}))
+	storeErr := errors.New("put failed")
+	store := &putErrorStore{Store: inner, err: storeErr}
+	arg, err := u2m.NewProfileWorkspaceOAuthArgument("https://workspace.example.test", profileName)
+	require.NoError(t, err)
+
+	err = storeLoginToken(t.Context(), store, storage.StorageModeSecure, arg, &oauth2.Token{AccessToken: "new-token"})
+
+	assert.ErrorIs(t, err, storeErr)
+	_, err = inner.Lookup(profileName)
+	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
 
 // logBuffer is a thread-safe bytes.Buffer for capturing log output in tests.
@@ -61,18 +98,10 @@ func loadTestProfile(t *testing.T, ctx context.Context, profileName string) *pro
 type fakeDiscoveryPersistentAuth struct {
 	token        *oauth2.Token
 	challengeErr error
-	tokenErr     error
 }
 
-func (f *fakeDiscoveryPersistentAuth) Challenge() error {
-	return f.challengeErr
-}
-
-func (f *fakeDiscoveryPersistentAuth) Token() (*oauth2.Token, error) {
-	if f.tokenErr != nil {
-		return nil, f.tokenErr
-	}
-	return f.token, nil
+func (f *fakeDiscoveryPersistentAuth) Challenge() (*oauth2.Token, error) {
+	return f.token, f.challengeErr
 }
 
 func (f *fakeDiscoveryPersistentAuth) Close() error {
@@ -248,7 +277,7 @@ func TestSetWorkspaceIDForUnifiedHost(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "https://unified.databricks.com", authArguments.Host)
 	assert.Equal(t, "test-unified-account", authArguments.AccountID)
-	assert.Equal(t, "", authArguments.WorkspaceID) // Empty is valid for account-level access
+	assert.Empty(t, authArguments.WorkspaceID) // Empty is valid for account-level access
 
 	// Test workspace_id is optional - should default to empty when no profile exists
 	authArguments = auth.AuthArguments{
@@ -259,7 +288,7 @@ func TestSetWorkspaceIDForUnifiedHost(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "https://unified.databricks.com", authArguments.Host)
 	assert.Equal(t, "test-unified-account", authArguments.AccountID)
-	assert.Equal(t, "", authArguments.WorkspaceID) // Empty is valid for account-level access
+	assert.Empty(t, authArguments.WorkspaceID) // Empty is valid for account-level access
 }
 
 func TestLoadProfileByNameAndClusterID(t *testing.T) {
@@ -458,12 +487,75 @@ func TestSplitScopes(t *testing.T) {
 	}
 }
 
+func TestU2MClientIDFromProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile *profile.Profile
+		want    string
+	}{
+		{name: "no profile"},
+		{
+			name:    "implicit auth type",
+			profile: &profile.Profile{ClientID: "custom-client-id"},
+		},
+		{
+			name:    "M2M auth type",
+			profile: &profile.Profile{AuthType: "oauth-m2m", ClientID: "custom-client-id"},
+		},
+		{
+			name:    "U2M auth type",
+			profile: &profile.Profile{AuthType: authTypeDatabricksCLI, ClientID: "custom-client-id"},
+			want:    "custom-client-id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, u2mClientIDFromProfile(tt.profile))
+		})
+	}
+}
+
+func TestU2MResourcesFromProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile *profile.Profile
+		want    []string
+	}{
+		{name: "no profile"},
+		{
+			name:    "implicit auth type",
+			profile: &profile.Profile{Resources: "https://workspace.test/ai-gateway/mcp/system.ai.github"},
+		},
+		{
+			name:    "M2M auth type",
+			profile: &profile.Profile{AuthType: "oauth-m2m", Resources: "https://workspace.test/ai-gateway/mcp/system.ai.github"},
+		},
+		{
+			name:    "U2M auth type single resource",
+			profile: &profile.Profile{AuthType: authTypeDatabricksCLI, Resources: "https://workspace.test/ai-gateway/mcp/system.ai.github"},
+			want:    []string{"https://workspace.test/ai-gateway/mcp/system.ai.github"},
+		},
+		{
+			name:    "U2M auth type multiple resources",
+			profile: &profile.Profile{AuthType: authTypeDatabricksCLI, Resources: "https://workspace.test/ai-gateway/mcp/system.ai.github, https://workspace.test/ai-gateway/mcp/system.ai.slack"},
+			want:    []string{"https://workspace.test/ai-gateway/mcp/system.ai.github", "https://workspace.test/ai-gateway/mcp/system.ai.slack"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, u2mResourcesFromProfile(tt.profile))
+		})
+	}
+}
+
 func TestRunHostDiscovery_NoHost(t *testing.T) {
 	ctx := t.Context()
 	args := &auth.AuthArguments{}
 	runHostDiscovery(ctx, args)
-	assert.Equal(t, "", args.AccountID)
-	assert.Equal(t, "", args.WorkspaceID)
+	assert.Empty(t, args.AccountID)
+	assert.Empty(t, args.WorkspaceID)
 }
 
 func TestRunHostDiscovery_ExplicitFieldsNotOverridden(t *testing.T) {
@@ -525,7 +617,7 @@ func TestRunHostDiscovery_ClassicWorkspaceDoesNotSetAccountID(t *testing.T) {
 	runHostDiscovery(ctx, args)
 
 	// Only workspace_id is set; account_id stays empty since discovery didn't return it.
-	assert.Equal(t, "", args.AccountID)
+	assert.Empty(t, args.AccountID)
 	assert.Equal(t, "12345", args.WorkspaceID)
 }
 
@@ -543,7 +635,101 @@ func TestSetHostAndAccountId_WorkspaceIDNoneSentinelInherited(t *testing.T) {
 	}
 	err := setHostAndAccountId(ctx, skipProfile, &args, []string{})
 	assert.NoError(t, err)
-	assert.Equal(t, auth.WorkspaceIDNone, args.WorkspaceID)
+	assert.Equal(t, profile.WorkspaceIDNone, args.WorkspaceID)
+}
+
+func TestShouldPromptWorkspace(t *testing.T) {
+	t.Setenv("DATABRICKS_CONFIG_FILE", "./testdata/.databrickscfg")
+	ctx, _ := cmdio.SetupTest(t.Context(), cmdio.TestOptions{})
+
+	legacyAccountProfile := loadTestProfile(t, ctx, "spog-skip-workspace")
+	newAccountProfile := loadTestProfile(t, ctx, "spog-skip-workspace-new")
+	workspaceProfile := loadTestProfile(t, ctx, "unified-workspace")
+
+	tests := []struct {
+		name            string
+		authArguments   auth.AuthArguments
+		existingProfile *profile.Profile
+		skipWorkspace   bool
+		want            bool
+	}{
+		{
+			name:          "no profile, account_id set, no workspace_id",
+			authArguments: auth.AuthArguments{AccountID: "acc"},
+			want:          true,
+		},
+		{
+			name:          "classic account console host never prompts",
+			authArguments: auth.AuthArguments{Host: "https://accounts.test", AccountID: "acc"},
+			want:          false,
+		},
+		{
+			name:          "classic account console host without scheme never prompts",
+			authArguments: auth.AuthArguments{Host: "accounts.test", AccountID: "acc"},
+			want:          false,
+		},
+		{
+			name:          "accounts-dod host never prompts",
+			authArguments: auth.AuthArguments{Host: "https://accounts-dod.test", AccountID: "acc"},
+			want:          false,
+		},
+		{
+			name:          "workspace host with account_id prompts",
+			authArguments: auth.AuthArguments{Host: "https://myworkspace.test", AccountID: "acc"},
+			want:          true,
+		},
+		{
+			name:          "classic account console host with workspace_id set never prompts",
+			authArguments: auth.AuthArguments{Host: "https://accounts.test", AccountID: "acc", WorkspaceID: "12345"},
+			want:          false,
+		},
+		{
+			name:            "re-login into legacy account-only profile (workspace_id = none)",
+			authArguments:   auth.AuthArguments{AccountID: "spog-account"},
+			existingProfile: legacyAccountProfile,
+			want:            false,
+		},
+		{
+			name:            "re-login into new account-only profile (no workspace_id key)",
+			authArguments:   auth.AuthArguments{AccountID: "spog-account"},
+			existingProfile: newAccountProfile,
+			want:            false,
+		},
+		{
+			name:            "re-login into workspace profile prompts when workspace_id missing from args",
+			authArguments:   auth.AuthArguments{AccountID: "test-unified-account"},
+			existingProfile: workspaceProfile,
+			want:            true,
+		},
+		{
+			name:            "account-only profile for a different account still prompts",
+			authArguments:   auth.AuthArguments{AccountID: "different-account"},
+			existingProfile: legacyAccountProfile,
+			want:            true,
+		},
+		{
+			name:          "skipWorkspace suppresses the prompt",
+			authArguments: auth.AuthArguments{AccountID: "acc"},
+			skipWorkspace: true,
+			want:          false,
+		},
+		{
+			name:          "no account_id means no prompt",
+			authArguments: auth.AuthArguments{},
+			want:          false,
+		},
+		{
+			name:          "workspace_id already known means no prompt",
+			authArguments: auth.AuthArguments{AccountID: "acc", WorkspaceID: "12345"},
+			want:          false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldPromptWorkspace(&tt.authArguments, tt.existingProfile, tt.skipWorkspace)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestSetHostAndAccountId_URLParamsOverrideProfile(t *testing.T) {
@@ -562,6 +748,55 @@ func TestSetHostAndAccountId_URLParamsOverrideProfile(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "https://unified.databricks.com", args.Host)
 	assert.Equal(t, "99999", args.WorkspaceID)
+}
+
+func TestGetProfileName(t *testing.T) {
+	tests := []struct {
+		name string
+		args *auth.AuthArguments
+		want string
+	}{
+		{
+			name: "account id set",
+			args: &auth.AuthArguments{Host: "https://db-deco-test.databricks.com", AccountID: "abc-123"},
+			want: "ACCOUNT-abc-123",
+		},
+		{
+			name: "no account id falls back to host",
+			args: &auth.AuthArguments{Host: "https://db-deco-test.databricks.com"},
+			want: "db-deco-test",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, getProfileName(tt.args))
+		})
+	}
+}
+
+// TestSkipWorkspaceProfileNameUsesDiscoveredAccountID verifies that the
+// pre-naming discovery block populates AccountID from .well-known so the
+// profile-name prompt suggests ACCOUNT-<account-id> instead of the host-based
+// default.
+func TestSkipWorkspaceProfileNameUsesDiscoveredAccountID(t *testing.T) {
+	server := newDiscoveryServer(t, map[string]any{
+		"account_id":    "abc-123",
+		"oidc_endpoint": "https://spog.example.com/oidc/accounts/abc-123",
+	})
+
+	ctx := t.Context()
+	args := &auth.AuthArguments{Host: server.URL}
+
+	// Mirrors the pre-naming block in newLoginCommand's RunE for --skip-workspace.
+	params := auth.ExtractHostQueryParams(args.Host)
+	args.Host = params.Host
+	if args.AccountID == "" {
+		args.AccountID = params.AccountID
+	}
+	runHostDiscovery(ctx, args)
+
+	assert.Equal(t, "abc-123", args.AccountID)
+	assert.Equal(t, "ACCOUNT-abc-123", getProfileName(args))
 }
 
 func TestValidateDiscoveryFlagCompatibility(t *testing.T) {
@@ -596,6 +831,12 @@ func TestValidateDiscoveryFlagCompatibility(t *testing.T) {
 			wantErr: "--configure-serverless requires --host to be specified",
 		},
 		{
+			name:    "resource is incompatible",
+			setFlag: "resource",
+			flagVal: "https://workspace.test/ai-gateway/mcp-services/system.ai.github",
+			wantErr: "--resource requires --host to be specified",
+		},
+		{
 			name: "no flags set is ok",
 		},
 	}
@@ -606,6 +847,7 @@ func TestValidateDiscoveryFlagCompatibility(t *testing.T) {
 			cmd.Flags().String("workspace-id", "", "")
 			cmd.Flags().Bool("configure-cluster", false, "")
 			cmd.Flags().Bool("configure-serverless", false, "")
+			cmd.Flags().StringArray("resource", nil, "")
 
 			if tt.setFlag != "" {
 				require.NoError(t, cmd.Flags().Set(tt.setFlag, tt.flagVal))
@@ -647,7 +889,7 @@ func TestDiscoveryLogin_IntrospectionFailureStillSavesProfile(t *testing.T) {
 		timeout:     time.Second,
 		scopes:      "all-apis, ,sql,",
 		browserFunc: func(string) error { return nil },
-		tokenCache:  newTestTokenCache(),
+		tokenStore:  newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -661,6 +903,38 @@ func TestDiscoveryLogin_IntrospectionFailureStillSavesProfile(t *testing.T) {
 	assert.Equal(t, "all-apis,sql", savedProfile.Scopes)
 	assert.Empty(t, savedProfile.AccountID)
 	assert.Empty(t, savedProfile.WorkspaceID)
+}
+
+func TestDiscoveryLogin_ProfileSaveFailureDoesNotStoreToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	parentFile := filepath.Join(tmpDir, "not-a-directory")
+	require.NoError(t, os.WriteFile(parentFile, nil, 0o600))
+	t.Setenv("DATABRICKS_CONFIG_FILE", filepath.Join(parentFile, ".databrickscfg"))
+
+	oauthArg, err := u2m.NewBasicDiscoveryOAuthArgument("DISCOVERY")
+	require.NoError(t, err)
+	oauthArg.SetDiscoveredHost("https://workspace.example.test")
+
+	dc := &fakeDiscoveryClient{
+		oauthArg: oauthArg,
+		persistentAuth: &fakeDiscoveryPersistentAuth{
+			token: &oauth2.Token{AccessToken: "test-token"},
+		},
+		introspectionErr: errors.New("introspection failed"),
+	}
+	store := &countingStore{Store: storage.NewMemoryStore()}
+
+	ctx, _ := cmdio.NewTestContextWithStdout(t.Context())
+	err = discoveryLogin(ctx, discoveryLoginInputs{
+		dc:          dc,
+		profileName: "DISCOVERY",
+		timeout:     time.Second,
+		browserFunc: func(string) error { return nil },
+		tokenStore:  store,
+	})
+
+	require.ErrorContains(t, err, "saving profile")
+	assert.Zero(t, store.putCalls)
 }
 
 func TestDiscoveryLogin_AccountIDMismatchWarning(t *testing.T) {
@@ -702,7 +976,7 @@ func TestDiscoveryLogin_AccountIDMismatchWarning(t *testing.T) {
 		timeout:         time.Second,
 		existingProfile: existingProfile,
 		browserFunc:     func(string) error { return nil },
-		tokenCache:      newTestTokenCache(),
+		tokenStore:      newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -757,7 +1031,7 @@ func TestDiscoveryLogin_NoWarningWhenAccountIDsMatch(t *testing.T) {
 		timeout:         time.Second,
 		existingProfile: existingProfile,
 		browserFunc:     func(string) error { return nil },
-		tokenCache:      newTestTokenCache(),
+		tokenStore:      newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -783,7 +1057,7 @@ func TestDiscoveryLogin_EmptyDiscoveredHostReturnsError(t *testing.T) {
 		profileName: "DISCOVERY",
 		timeout:     time.Second,
 		browserFunc: func(string) error { return nil },
-		tokenCache:  newTestTokenCache(),
+		tokenStore:  newTestStore(),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no workspace host was discovered")
@@ -809,9 +1083,11 @@ func TestDiscoveryLogin_ReloginPreservesExistingProfileScopes(t *testing.T) {
 	}
 
 	existingProfile := &profile.Profile{
-		Name:   "DISCOVERY",
-		Host:   "https://old-workspace.example.com",
-		Scopes: "sql,clusters",
+		Name:     "DISCOVERY",
+		Host:     "https://old-workspace.example.com",
+		Scopes:   "sql,clusters",
+		AuthType: authTypeDatabricksCLI,
+		ClientID: "custom-client-id",
 	}
 
 	// No --scopes flag (empty string), should fall back to existing profile scopes.
@@ -820,9 +1096,10 @@ func TestDiscoveryLogin_ReloginPreservesExistingProfileScopes(t *testing.T) {
 		dc:              dc,
 		profileName:     "DISCOVERY",
 		timeout:         time.Second,
+		clientID:        existingProfile.ClientID,
 		existingProfile: existingProfile,
 		browserFunc:     func(string) error { return nil },
-		tokenCache:      newTestTokenCache(),
+		tokenStore:      newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -831,6 +1108,51 @@ func TestDiscoveryLogin_ReloginPreservesExistingProfileScopes(t *testing.T) {
 	require.NotNil(t, savedProfile)
 	assert.Equal(t, "https://workspace.example.com", savedProfile.Host)
 	assert.Equal(t, "sql,clusters", savedProfile.Scopes)
+	assert.Equal(t, "custom-client-id", savedProfile.ClientID)
+}
+
+func TestDiscoveryLogin_ExplicitClientIDOverridesExistingProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, ".databrickscfg")
+	err := os.WriteFile(configPath, []byte(""), 0o600)
+	require.NoError(t, err)
+	t.Setenv("DATABRICKS_CONFIG_FILE", configPath)
+
+	oauthArg, err := u2m.NewBasicDiscoveryOAuthArgument("DISCOVERY")
+	require.NoError(t, err)
+	oauthArg.SetDiscoveredHost("https://workspace.example.com")
+
+	dc := &fakeDiscoveryClient{
+		oauthArg: oauthArg,
+		persistentAuth: &fakeDiscoveryPersistentAuth{
+			token: &oauth2.Token{AccessToken: "test-token"},
+		},
+		introspectionErr: errors.New("introspection failed"),
+	}
+
+	existingProfile := &profile.Profile{
+		Name:     "DISCOVERY",
+		Host:     "https://old-workspace.example.com",
+		AuthType: authTypeDatabricksCLI,
+		ClientID: "profile-client-id",
+	}
+
+	ctx, _ := cmdio.NewTestContextWithStdout(t.Context())
+	err = discoveryLogin(ctx, discoveryLoginInputs{
+		dc:              dc,
+		profileName:     "DISCOVERY",
+		timeout:         time.Second,
+		clientID:        "flag-client-id",
+		existingProfile: existingProfile,
+		browserFunc:     func(string) error { return nil },
+		tokenStore:      newTestStore(),
+	})
+	require.NoError(t, err)
+
+	savedProfile, err := loadProfileByName(ctx, "DISCOVERY", profile.DefaultProfiler)
+	require.NoError(t, err)
+	require.NotNil(t, savedProfile)
+	assert.Equal(t, "flag-client-id", savedProfile.ClientID)
 }
 
 func TestDiscoveryLogin_ExplicitScopesOverrideExistingProfile(t *testing.T) {
@@ -867,7 +1189,7 @@ func TestDiscoveryLogin_ExplicitScopesOverrideExistingProfile(t *testing.T) {
 		scopes:          "all-apis",
 		existingProfile: existingProfile,
 		browserFunc:     func(string) error { return nil },
-		tokenCache:      newTestTokenCache(),
+		tokenStore:      newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -913,7 +1235,7 @@ func TestDiscoveryLogin_SPOGHostPopulatesAccountIDFromDiscovery(t *testing.T) {
 		profileName: "DISCOVERY",
 		timeout:     time.Second,
 		browserFunc: func(string) error { return nil },
-		tokenCache:  newTestTokenCache(),
+		tokenStore:  newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -954,7 +1276,7 @@ func TestDiscoveryLogin_IntrospectionFallsBackWhenDiscoveryFails(t *testing.T) {
 		profileName: "DISCOVERY",
 		timeout:     time.Second,
 		browserFunc: func(string) error { return nil },
-		tokenCache:  newTestTokenCache(),
+		tokenStore:  newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -1009,7 +1331,7 @@ auth_type = databricks-cli
 		timeout:         time.Second,
 		existingProfile: existingProfile,
 		browserFunc:     func(string) error { return nil },
-		tokenCache:      newTestTokenCache(),
+		tokenStore:      newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -1070,7 +1392,7 @@ auth_type = databricks-cli
 		timeout:         time.Second,
 		existingProfile: existingProfile,
 		browserFunc:     func(string) error { return nil },
-		tokenCache:      newTestTokenCache(),
+		tokenStore:      newTestStore(),
 	})
 	require.NoError(t, err)
 
@@ -1080,6 +1402,40 @@ auth_type = databricks-cli
 	assert.Equal(t, "https://new-workspace.example.com", savedProfile.Host)
 	assert.Equal(t, "fresh-account", savedProfile.AccountID, "account_id should be saved from introspection")
 	assert.Equal(t, "222222", savedProfile.WorkspaceID, "workspace_id should be updated to fresh introspection value")
+}
+
+func TestDiscoveryLogin_OverridesHostFromEnv(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, ".databrickscfg")
+	err := os.WriteFile(configPath, []byte(""), 0o600)
+	require.NoError(t, err)
+	t.Setenv("DATABRICKS_CONFIG_FILE", configPath)
+
+	oauthArg, err := u2m.NewBasicDiscoveryOAuthArgument("DISCOVERY")
+	require.NoError(t, err)
+	oauthArg.SetDiscoveredHost("https://workspace.example.com")
+
+	dc := &fakeDiscoveryClient{
+		oauthArg: oauthArg,
+		persistentAuth: &fakeDiscoveryPersistentAuth{
+			token: &oauth2.Token{AccessToken: "test-token"},
+		},
+		introspectionErr: errors.New("introspection failed"),
+	}
+
+	ctx, stderr := cmdio.NewTestContextWithStderr(t.Context())
+	ctx = env.Set(ctx, "DATABRICKS_DISCOVERY_HOST", "https://login.staging.test")
+	err = discoveryLogin(ctx, discoveryLoginInputs{
+		dc:          dc,
+		profileName: "DISCOVERY",
+		timeout:     time.Second,
+		browserFunc: func(string) error { return nil },
+		tokenStore:  newTestStore(),
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, stderr.String(), "Opening https://login.staging.test in your browser...")
+	assert.NotContains(t, stderr.String(), "Opening login.databricks.com in your browser...")
 }
 
 func TestLoginRejectsPositionalArgWithHostFlag(t *testing.T) {

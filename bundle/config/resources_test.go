@@ -15,6 +15,9 @@ import (
 	"github.com/databricks/databricks-sdk-go/service/serving"
 
 	"github.com/databricks/cli/bundle/config/resources"
+	"github.com/databricks/cli/libs/structs/structpath"
+	"github.com/databricks/cli/libs/structs/structtag"
+	"github.com/databricks/cli/libs/structs/structwalk"
 	"github.com/databricks/cli/libs/workspaceurls"
 	"github.com/databricks/databricks-sdk-go/experimental/mocks"
 	"github.com/databricks/databricks-sdk-go/service/apps"
@@ -53,15 +56,13 @@ import (
 func TestCustomMarshallerIsImplemented(t *testing.T) {
 	rt := reflect.TypeFor[Resources]()
 
-	for i := range rt.NumField() {
-		field := rt.Field(i)
-
+	for field := range rt.Fields() {
 		// Fields in Resources are expected be of the form map[string]*resourceStruct
 		assert.Equal(t, reflect.Map, field.Type.Kind(), "Resource %s is not a map", field.Name)
 		kt := field.Type.Key()
 		assert.Equal(t, reflect.String, kt.Kind(), "Resource %s is not a map with string keys", field.Name)
 		vt := field.Type.Elem()
-		assert.Equal(t, reflect.Ptr, vt.Kind(), "Resource %s is not a map with pointer values", field.Name)
+		assert.Equal(t, reflect.Pointer, vt.Kind(), "Resource %s is not a map with pointer values", field.Name)
 
 		// Marshalling a resourceStruct will panic if resourceStruct does not have a custom marshaller
 		// This is because resourceStruct embeds a Go SDK struct that implements
@@ -95,8 +96,7 @@ func TestResourcesAllResourcesCompleteness(t *testing.T) {
 		types = append(types, group.Description.PluralName)
 	}
 
-	for i := range rt.NumField() {
-		field := rt.Field(i)
+	for field := range rt.Fields() {
 		jsonTag := field.Tag.Get("json")
 
 		if idx := strings.Index(jsonTag, ","); idx != -1 {
@@ -112,42 +112,52 @@ func TestSupportedResources(t *testing.T) {
 	actual := SupportedResources()
 
 	typ := reflect.TypeFor[Resources]()
-	for i := range typ.NumField() {
-		field := typ.Field(i)
+	for field := range typ.Fields() {
 		jsonTags := strings.Split(field.Tag.Get("json"), ",")
 		pluralName := jsonTags[0]
 		assert.Equal(t, actual[pluralName].PluralName, pluralName)
 	}
 }
 
-// Bundle resources whose InitializeURL() resolves via workspaceurls. When a
-// pattern key or a bundle plural name drifts, ResourceURL returns "" and this
-// test fails loudly instead of silently producing empty URLs in bundle summary.
+// All bundle resources must have a workspace URL, except those listed in noURL.
+// When a pattern key or a bundle plural name drifts, ResourceURL returns "" and
+// this test fails loudly instead of silently producing empty URLs in bundle summary.
+// When adding a new resource, add a URL pattern in libs/workspaceurls or add the
+// plural name to noURL with a comment explaining why no URL exists.
 func TestBundleResourcePluralNamesResolveInWorkspaceURLs(t *testing.T) {
-	withURLs := []string{
-		"alerts",
-		"apps",
-		"clusters",
-		"dashboards",
-		"experiments",
-		"jobs",
-		"models",
-		"model_serving_endpoints",
-		"pipelines",
-		"registered_models",
-		"sql_warehouses",
+	// Resources that intentionally have no workspace URL.
+	noURL := map[string]bool{
+		"external_locations": true,
+		// A job run does have a workspace URL, but it's addressed by two IDs
+		// (job + run) so it can't be expressed as a single-ID pattern here; it's
+		// built in JobRun.InitializeURL via workspaceurls.JobRunURL instead.
+		"job_runs":                     true,
+		"postgres_branches":            true,
+		"postgres_databases":           true,
+		"postgres_endpoints":           true,
+		"postgres_projects":            true,
+		"postgres_roles":               true,
+		"postgres_snapshot_schedules":  true,
+		"secret_scopes":                true,
+		"internal_immutable_snapshots": true,
 	}
 
 	supported := SupportedResources()
-	for _, name := range withURLs {
+
+	// Catch stale noURL entries when a resource is removed from SupportedResources.
+	for name := range noURL {
 		_, ok := supported[name]
-		require.Truef(t, ok, "%q is not a bundle plural name, update SupportedResources or this test", name)
+		require.Truef(t, ok, "%q is in the noURL list but is not a supported bundle resource; remove it from noURL", name)
 	}
 
 	base := url.URL{Scheme: "https", Host: "example.com"}
-	for _, name := range withURLs {
+	for name := range supported {
 		got := workspaceurls.ResourceURL(base, name, "test-id")
-		assert.NotEmptyf(t, got, "workspaceurls.ResourceURL(%q) returned empty; pattern key renamed or alias missing", name)
+		if noURL[name] {
+			assert.Emptyf(t, got, "workspaceurls.ResourceURL(%q) returned non-empty; remove %q from noURL or remove its URL pattern", name, name)
+		} else {
+			assert.NotEmptyf(t, got, "workspaceurls.ResourceURL(%q) returned empty; add a URL pattern in libs/workspaceurls or add %q to noURL", name, name)
+		}
 	}
 }
 
@@ -156,6 +166,11 @@ func TestResourcesBindSupport(t *testing.T) {
 		Jobs: map[string]*resources.Job{
 			"my_job": {
 				JobSettings: jobs.JobSettings{},
+			},
+		},
+		JobRuns: map[string]*resources.JobRun{
+			"my_job_run": {
+				RunNow: jobs.RunNow{},
 			},
 		},
 		Pipelines: map[string]*resources.Pipeline{
@@ -191,8 +206,17 @@ func TestResourcesBindSupport(t *testing.T) {
 		Clusters: map[string]*resources.Cluster{
 			"my_cluster": {},
 		},
+		InstancePools: map[string]*resources.InstancePool{
+			"my_instance_pool": {},
+		},
+		ClusterPolicies: map[string]*resources.ClusterPolicy{
+			"my_cluster_policy": {},
+		},
 		Dashboards: map[string]*resources.Dashboard{
 			"my_dashboard": {},
+		},
+		GenieSpaces: map[string]*resources.GenieSpace{
+			"my_genie_space": {},
 		},
 		Volumes: map[string]*resources.Volume{
 			"my_volume": {
@@ -219,9 +243,33 @@ func TestResourcesBindSupport(t *testing.T) {
 				CreateServingEndpoint: serving.CreateServingEndpoint{},
 			},
 		},
+		ModelServices: map[string]*resources.ModelService{
+			"my_model_service": {
+				ModelServiceConfig: resources.ModelServiceConfig{},
+			},
+		},
+		McpServices: map[string]*resources.McpService{
+			"my_mcp_service": {
+				McpServiceConfig: resources.McpServiceConfig{},
+			},
+		},
+		ModelProviderServices: map[string]*resources.ModelProviderService{
+			"my_model_provider_service": {
+				ModelProviderServiceConfig: resources.ModelProviderServiceConfig{},
+			},
+		},
 		SecretScopes: map[string]*resources.SecretScope{
 			"my_secret_scope": {
 				Name: "0",
+			},
+		},
+		Secrets: map[string]*resources.Secret{
+			"my_secret": {
+				Secret: catalog.Secret{
+					CatalogName: "main",
+					SchemaName:  "default",
+					Name:        "my_secret",
+				},
 			},
 		},
 		SqlWarehouses: map[string]*resources.SqlWarehouse{
@@ -273,6 +321,53 @@ func TestResourcesBindSupport(t *testing.T) {
 				},
 			},
 		},
+		PostgresCatalogs: map[string]*resources.PostgresCatalog{
+			"my_postgres_catalog": {
+				PostgresCatalogConfig: resources.PostgresCatalogConfig{
+					CatalogId: "my_postgres_catalog",
+				},
+			},
+		},
+		PostgresDatabases: map[string]*resources.PostgresDatabase{
+			"my_postgres_database": {
+				PostgresDatabaseConfig: resources.PostgresDatabaseConfig{
+					DatabaseId: "my-postgres-database",
+					Parent:     "projects/my-postgres-project/branches/my-postgres-branch",
+				},
+			},
+		},
+		PostgresRoles: map[string]*resources.PostgresRole{
+			"my_postgres_role": {
+				PostgresRoleConfig: resources.PostgresRoleConfig{
+					RoleId: "my-postgres-role",
+					Parent: "projects/my-postgres-project/branches/my-postgres-branch",
+					RoleRoleSpec: postgres.RoleRoleSpec{
+						PostgresRole: "my_postgres_role",
+					},
+				},
+			},
+		},
+		PostgresSyncedTables: map[string]*resources.PostgresSyncedTable{
+			"my_postgres_synced_table": {
+				PostgresSyncedTableConfig: resources.PostgresSyncedTableConfig{
+					SyncedTableId: "catalog.schema.my_postgres_synced_table",
+				},
+			},
+		},
+		PostgresSnapshotSchedules: map[string]*resources.PostgresSnapshotSchedule{
+			"my_postgres_snapshot_schedule": {
+				PostgresSnapshotScheduleConfig: resources.PostgresSnapshotScheduleConfig{
+					Branch: "projects/my-postgres-project/branches/my-postgres-branch",
+				},
+			},
+		},
+		Features: map[string]*resources.Feature{
+			"my_feature": {
+				Feature: ml.Feature{
+					FullName: "main.myschema.my_feature",
+				},
+			},
+		},
 		VectorSearchEndpoints: map[string]*resources.VectorSearchEndpoint{
 			"my_vector_search_endpoint": {
 				CreateEndpoint: vectorsearch.CreateEndpoint{
@@ -281,27 +376,46 @@ func TestResourcesBindSupport(t *testing.T) {
 				},
 			},
 		},
+		VectorSearchIndexes: map[string]*resources.VectorSearchIndex{
+			"my_vector_search_index": {
+				CreateVectorIndexRequest: vectorsearch.CreateVectorIndexRequest{
+					Name:         "my_vector_search_index",
+					EndpointName: "my_vector_search_endpoint",
+					PrimaryKey:   "id",
+					IndexType:    vectorsearch.VectorIndexTypeDeltaSync,
+				},
+			},
+		},
 	}
 	unbindableResources := map[string]bool{
-		"model": true,
+		"model":                       true,
+		"internal_immutable_snapshot": true,
 	}
 
 	ctx := t.Context()
 	m := mocks.NewMockWorkspaceClient(t)
 	m.GetMockJobsAPI().EXPECT().Get(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockJobsAPI().EXPECT().GetRun(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockPipelinesAPI().EXPECT().Get(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockExperimentsAPI().EXPECT().GetExperiment(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockFeatureEngineeringAPI().EXPECT().GetFeature(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockRegisteredModelsAPI().EXPECT().Get(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockCatalogsAPI().EXPECT().GetByName(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockExternalLocationsAPI().EXPECT().GetByName(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockSchemasAPI().EXPECT().GetByFullName(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockClustersAPI().EXPECT().GetByClusterId(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockInstancePoolsAPI().EXPECT().GetByInstancePoolId(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockClusterPoliciesAPI().EXPECT().GetByPolicyId(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockLakeviewAPI().EXPECT().Get(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockGenieAPI().EXPECT().GetSpace(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockVolumesAPI().EXPECT().Read(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockAppsAPI().EXPECT().GetByName(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockAlertsV2API().EXPECT().GetAlertById(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockQualityMonitorsAPI().EXPECT().Get(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockServingEndpointsAPI().EXPECT().Get(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockAiGatewayAPI().EXPECT().GetModelService(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockAiGatewayAPI().EXPECT().GetMcpService(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockAiGatewayAPI().EXPECT().GetModelProviderService(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockSecretsAPI().EXPECT().ListScopesAll(mock.Anything).Return([]workspace.SecretScope{
 		{Name: "0"},
 	}, nil)
@@ -312,7 +426,15 @@ func TestResourcesBindSupport(t *testing.T) {
 	m.GetMockPostgresAPI().EXPECT().GetProject(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockPostgresAPI().EXPECT().GetBranch(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockPostgresAPI().EXPECT().GetEndpoint(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockPostgresAPI().EXPECT().GetCatalog(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockPostgresAPI().EXPECT().GetDatabase(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockPostgresAPI().EXPECT().GetRole(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockPostgresAPI().EXPECT().GetSyncedTable(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockPostgresAPI().EXPECT().GetSnapshotSchedule(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockPostgresAPI().EXPECT().GetRole(mock.Anything, mock.Anything).Return(nil, nil)
 	m.GetMockVectorSearchEndpointsAPI().EXPECT().GetEndpoint(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockVectorSearchIndexesAPI().EXPECT().GetIndexByIndexName(mock.Anything, mock.Anything).Return(nil, nil)
+	m.GetMockSecretsUcAPI().EXPECT().GetSecret(mock.Anything, mock.Anything).Return(&catalog.Secret{FullName: "0"}, nil)
 
 	allResources := supportedResources.AllResources()
 	for _, group := range allResources {
@@ -320,8 +442,8 @@ func TestResourcesBindSupport(t *testing.T) {
 			t.Fatalf("Expected at least one resource in group %s", group.Description)
 		}
 		for _, resource := range group.Resources {
-			// bind operation requires resource to be returned from FindResourceByConfigKey
-			r, err := supportedResources.FindResourceByConfigKey("my_" + resource.ResourceDescription().SingularName)
+			// bind operation requires resource to be returned from ResolveKey
+			r, _, err := supportedResources.ResolveKey("my_" + resource.ResourceDescription().SingularName)
 			assert.NoError(t, err)
 
 			// bind operation requires Exists to return true
@@ -329,5 +451,72 @@ func TestResourcesBindSupport(t *testing.T) {
 			assert.NoError(t, err)
 			assert.True(t, exists)
 		}
+	}
+}
+
+func TestAllInteralResourcesAreMarkedAsInternal(t *testing.T) {
+	internalResourceKeys := map[string]reflect.Type{}
+	err := structwalk.WalkType(reflect.TypeFor[Resources](), func(path *structpath.PatternNode, typ reflect.Type, field *reflect.StructField) bool {
+		if path.Len() > 2 {
+			return false
+		}
+		if field == nil {
+			return true
+		}
+		tag := field.Tag.Get("bundle")
+		if structtag.BundleTag(tag).Internal() {
+			internalResourceKeys[field.Name] = typ
+		}
+		return true
+	})
+	assert.NoError(t, err)
+
+	for key, typ := range internalResourceKeys {
+		r := reflect.MakeMap(typ)
+		r.SetMapIndex(reflect.ValueOf("my_resources"), reflect.New(typ.Elem()).Elem())
+
+		resources := &Resources{}
+		res := reflect.ValueOf(resources).Elem()
+		field := res.FieldByName(key)
+		if !field.IsValid() && !field.CanSet() {
+			t.Fatalf("Field %s is not valid", key)
+		}
+		field.Set(r)
+		assert.True(t, resources.HasInternalResources())
+	}
+}
+
+func TestResolveKey(t *testing.T) {
+	r := &Resources{
+		Jobs:      map[string]*resources.Job{"foo": {}, "thing": {}},
+		Pipelines: map[string]*resources.Pipeline{"bar": {}, "thing": {}},
+	}
+
+	tests := []struct {
+		ref      string
+		wantType string
+		wantKey  string
+		wantErr  string
+	}{
+		{ref: "foo", wantType: "jobs", wantKey: "foo"},
+		{ref: "jobs.foo", wantType: "jobs", wantKey: "foo"},
+		{ref: "pipelines.thing", wantType: "pipelines", wantKey: "thing"},
+		{ref: "missing", wantErr: "no such resource: missing"},
+		{ref: "jobs.bar", wantErr: "no such resource: jobs.bar"},
+		{ref: "nosuchtype.foo", wantErr: "no such resource: nosuchtype.foo"},
+		{ref: "thing", wantErr: "ambiguous resource: thing (can resolve to jobs.thing, pipelines.thing); use a qualified name to disambiguate"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.ref, func(t *testing.T) {
+			res, key, err := r.ResolveKey(tc.ref)
+			if tc.wantErr != "" {
+				assert.EqualError(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantType, res.ResourceDescription().PluralName)
+			assert.Equal(t, tc.wantKey, key)
+		})
 	}
 }

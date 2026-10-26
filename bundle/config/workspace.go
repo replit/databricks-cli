@@ -2,13 +2,12 @@ package config
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"strconv"
 
 	"github.com/databricks/cli/bundle/env"
 	"github.com/databricks/cli/libs/auth"
 	"github.com/databricks/cli/libs/databrickscfg"
+	"github.com/databricks/cli/libs/liteswap"
 	"github.com/databricks/databricks-sdk-go"
 	"github.com/databricks/databricks-sdk-go/config"
 	"github.com/databricks/databricks-sdk-go/marshal"
@@ -137,12 +136,13 @@ func (w *Workspace) Config(ctx context.Context) *config.Config {
 		AzureClientID:    w.AzureClientID,
 		AzureTenantID:    w.AzureTenantID,
 		AzureEnvironment: w.AzureEnvironment,
-		AzureLoginAppID:  w.AzureLoginAppID,
+		AzureLoginAppID:  w.AzureLoginAppID, //nolint:staticcheck // SA1019: still accepted in bundle config; forwarded until the SDK drops the field
 
 		// Unified host
 		AccountID:   w.AccountID,
 		WorkspaceID: w.WorkspaceID,
 	}
+	liteswap.Apply(ctx, cfg)
 
 	for k := range config.ConfigAttributes {
 		attr := &config.ConfigAttributes[k]
@@ -178,9 +178,19 @@ func (w *Workspace) Client(ctx context.Context) (*databricks.WorkspaceClient, er
 
 	cfg := w.Config(ctx)
 
-	// If only the host is configured, we try and unambiguously match it to
-	// a profile in the user's databrickscfg file. Override the default loaders.
-	if w.Host != "" && w.Profile == "" {
+	switch {
+	case env.StrictProfileMatch(ctx) && (w.Host != "" || w.WorkspaceID != ""):
+		// The target's host and workspace ID must match a profile, even when
+		// auth env vars are set. A target with neither has nothing to match, so
+		// it resolves as without strict mode.
+		cfg.Loaders = databrickscfg.StrictProfileLoaders
+	case w.Profile != "":
+		// An explicit profile wins over auth env vars (#5096).
+		// ValidateConfigAndProfileHost below still checks host agreement.
+		cfg.Loaders = databrickscfg.ProfileAuthLoaders
+	case w.Host != "":
+		// If only the host is configured, we try and unambiguously match it to
+		// a profile in the user's databrickscfg file. Override the default loaders.
 		cfg.Loaders = []config.Loader{
 			// Load auth creds from env vars
 			config.ConfigAttributes,
@@ -208,14 +218,4 @@ func (w *Workspace) Client(ctx context.Context) (*databricks.WorkspaceClient, er
 	}
 
 	return databricks.NewWorkspaceClient((*databricks.Config)(cfg))
-}
-
-func init() {
-	arg0 := os.Args[0]
-
-	// Configure DATABRICKS_CLI_PATH only if our caller intends to use this specific version of this binary.
-	// Otherwise, if it is equal to its basename, processes can find it in $PATH.
-	if arg0 != filepath.Base(arg0) {
-		os.Setenv("DATABRICKS_CLI_PATH", arg0)
-	}
 }

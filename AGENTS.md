@@ -1,6 +1,6 @@
 This file provides guidance to AI assistants when working with code in this repository.
 
-Rules prefixed `**RULE:**` are mandatory. `GOOD:` and `BAD:` labels on code snippets mark patterns to follow and patterns to avoid. This convention is a common best practice for AI-assistant rule files and is used consistently across `AGENTS.md` and `.agent/rules/*.md`.
+Rules prefixed `**RULE:**` are mandatory. `GOOD:` and `BAD:` labels on code snippets mark patterns to follow and patterns to avoid. This convention is a common best practice for AI-assistant rule files and is used consistently across `AGENTS.md` and `.agents/rules/*.md`.
 
 # Project Overview
 
@@ -9,8 +9,6 @@ This is the Databricks CLI, a command-line interface for interacting with Databr
 # General Rules
 
 **RULE: When moving code from one place to another, don't unnecessarily change or omit parts.** Keep refactors separate from content changes so reviewers can tell them apart.
-
-**RULE: Do not modify or remove existing comments in code you didn't write.** Comments often encode non-obvious context (a bug reference, a workaround, a reason the code is shaped a certain way) that is lost if rewritten. Leave them alone unless the user explicitly asks for a change.
 
 **RULE: Prefer simplicity over cleverness. Avoid speculative fallbacks and default values.** If you catch yourself adding a fallback branch "just in case," identify the correct path and use only that one. Reviewers in this repo reject speculative flexibility.
 
@@ -23,10 +21,12 @@ This is the Databricks CLI, a command-line interface for interacting with Databr
 ### Building and Testing
 
 - `./task build` - Build the CLI binary
-- `./task test` - Run unit and acceptance tests for all packages
+- `./task test` - Run unit and acceptance tests for all packages. This runs the *entire* acceptance suite locally against the fake server in `libs/testserver`.
 - `go test ./acceptance -run TestAccept/bundle/<path>/<to>/<folder> -tail -test.v` - run a single acceptance test
-- `./task integration` - Run integration tests (requires environment variables)
+- `./task integration` - Run integration tests (requires environment variables). The `integration/` tree is deprecated; new coverage that needs a real workspace goes into an acceptance test with `Cloud = true`.
 - `./task cover` - Generate test coverage reports
+
+Every acceptance test runs locally. `Cloud = true` in a `test.toml` means the test *also* runs against a real workspace when `CLOUD_ENV` is set — never that it skips the local run. See `.agents/rules/testing.md`.
 
 ### Code Quality
 
@@ -40,8 +40,8 @@ This is the Databricks CLI, a command-line interface for interacting with Databr
 ### Specialized Commands
 
 - `./task generate-schema` - Generate bundle JSON schema
-- `./task generate-docs` - Generate bundle documentation
-- `./task generate-genkit` - Run genkit to generate CLI commands and tagging workflow (requires universe repo)
+- `./task generate-cligen` - Regenerate CLI command stubs from the checked-in .codegen/cli.json
+- `./task generate-clijson` - Refresh .codegen/cli.json from the OpenAPI spec via genkit (requires universe repo)
 - `./task generate` - Run all generators
 
 ### Git Commands
@@ -68,7 +68,7 @@ GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true VISUAL=true GIT_PAGER=cat git rebase or
 **bundle/** - Core bundle functionality for Declarative Automation Bundles
 - `bundle/bundle.go` - Main Bundle struct and lifecycle management
 - `bundle/config/` - Configuration loading, validation, and schema
-- `bundle/deploy/` - Deployment logic (Terraform and direct modes)
+- `bundle/deploy/` - Deployment logic (file upload, locking, state)
 - `bundle/mutator/` - Configuration transformation pipeline
 - `bundle/phases/` - High-level deployment phases
 
@@ -84,31 +84,17 @@ GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true VISUAL=true GIT_PAGER=cat git rebase or
 
 **Mutators**: Transform bundle configuration through a pipeline. Located in `bundle/config/mutator/` and `bundle/mutator/`. Each mutator implements the `Mutator` interface.
 
-**Direct vs Terraform Deployment**: The CLI supports two deployment modes controlled by `DATABRICKS_BUNDLE_ENGINE` environment variable:
-- `terraform` (default) - Uses Terraform for resource management
-- `direct` - Direct API calls without Terraform
+**Direct deployment engine**: Bundles are deployed by the direct engine (`bundle/direct/`), which calls the APIs without Terraform. The Terraform engine was removed in v1.20.0: `bundle.engine: terraform` and `DATABRICKS_BUNDLE_ENGINE=terraform` are rejected, and existing Terraform state is migrated to the direct engine before the command runs.
 
 # Development Tips
 
 - Use `./task test-update` to regenerate acceptance test outputs after changes.
 - The CLI binary supports both `databricks` and `pipelines` command modes based on executable name.
 
-**RULE: Comments should explain "why", not "what".** Reviewers consistently reject comments that merely restate the code.
+**Stale golangci-lint cache across worktrees.** Triggered by `task lint` or a direct `go tool ... golangci-lint` run reporting issues in files under a *different* or deleted worktree, often with `no such file or directory` warnings. Fix — clear the cache and re-run, don't investigate the reported issues:
 
-**RULE: When code relies on a non-obvious invariant, workaround, or backend quirk, add a short comment stating the reason.** The inverse of the rule above: noise comments are bad, but missing comments are the single most common thing reviewers catch. Triggers include: API quirks (PATCH-like semantics, no get-by-name, stripped prefixes), fields intentionally included or excluded (output-only, etag, `ForceSendFields`), branches that look dead but are kept as guards, and tests where the expectation isn't obvious from the assertions.
-
-GOOD:
-
-```go
-// The Workspace API strips the "/Workspace" prefix from parent_path on GET,
-// so we re-add it here to match the local configuration.
-parentPath = "/Workspace" + parentPath
-```
-
-BAD:
-
-```go
-parentPath = "/Workspace" + parentPath
+```sh
+go tool -modfile=tools/go.mod golangci-lint cache clean
 ```
 
 # Common Mistakes
@@ -126,6 +112,16 @@ parentPath = "/Workspace" + parentPath
 **RULE: Use a non-resolving TLD reserved by [RFC 2606 §2](https://datatracker.ietf.org/doc/html/rfc2606#section-2) (`.test`, `.example`, `.invalid`, `.localhost`) for any test fixture host — `Config.Host`, `databricks.yml`'s `workspace.host`, `.databrickscfg`.** Real domains hit the SDK well-known endpoint resolver and can stall tests for ~5 minutes per call when the runner network can't fast-fail the lookup. The repo convention is `.test` (the TLD RFC 2606 specifically reserves "for use in testing"). See PR #5125 for prior history.
 
 Where a panic is genuinely possible (e.g. `reflect.Type.Elem()` on a non-pointer, division by an empty slice's length), validate at the entry point and return an error.
+
+**RULE: Never copy a `config.Config` by value.** It embeds a `sync.Mutex`, so `go vet` copylocks fails and CI lint blocks it (govet runs with enable-all). Pass it by pointer, or mutate the resolved config in place (e.g. set `HTTPTimeoutSeconds` on it before `client.New`; there is no per-request option).
+
+**RULE: Open URLs through `libs/browser`, never `github.com/pkg/browser` directly.** `pkg/browser` ignores the `BROWSER` env var, so `BROWSER=none` and custom browser commands break. `browser.Open(ctx, url)` handles empty/none/custom in one path; branch on `browser.IsDisabled(ctx)` first if you need custom messaging. For a custom `BROWSER=<command>`, launch via `libs/exec`, not an inline `cmd /c` (that broke Windows OAuth URLs via `%...%` expansion).
+
+**RULE: For hand-written workspace-routed raw API calls (`client.Do` / `apiClient.Do`), set routing headers via `libs/auth.WorkspaceIDHeaders`.** It emits `X-Databricks-Workspace-Id` and suppresses the legacy `workspace_id = none` sentinel. Grepping only for old header names misses calls that never set any routing header but still need one.
+
+**RULE: To keep an intentionally-unreferenced exported function, mark it `//deadcode:allow <reason>` within 6 lines above the `func`.** CI runs `deadcode -test ./...`; a func reachable only from a `*_test.go` is not flagged, so unwiring a feature can leave a sibling entry point dead. (`gofmt` inserts a blank `//` line between the directive and the doc comment; that's expected and still detected.)
+
+**RULE: Write platform agnostic code.** Avoid test logic that runs only on the operating system you are using. Do not forget about Windows!
 
 # Error Handling
 
@@ -168,6 +164,8 @@ if err != nil && strings.Contains(err.Error(), "does not exist") {
 	return nil
 }
 ```
+
+**RULE: Error strings must not end with punctuation or a newline (golangci-lint ST1005).** Applies to `fmt.Errorf` / `errors.New`: when appending a multi-sentence hint to an error, drop the final period (mid-string periods and newlines are fine). Keep `Error()` methods unpunctuated at the end too, for consistency.
 
 # CLI UX and validation
 

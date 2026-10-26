@@ -1,8 +1,12 @@
 package testserver
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +19,23 @@ func nowTime() *sdktime.Time {
 	return sdktime.New(time.Now().UTC())
 }
 
+// nextTraceID returns a 32-hex-character id shaped like the trace ids the real API puts
+// in error messages, so acceptance goldens normalize local and cloud identically.
+func nextTraceID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// Backend defaults applied to a project's status when the spec omits them.
+// These mirror the values the real API materializes on create.
+const (
+	defaultHistoryRetention      = 604800 * time.Second // 7 days
+	defaultSuspendTimeout        = 86400 * time.Second  // 1 day
+	defaultAutoscalingLimitMinCu = 1
+	defaultAutoscalingLimitMaxCu = 1
+)
+
 // postgresErrorResponse creates an error response with error code for postgres API.
 func postgresErrorResponse(statusCode int, errorCode, message string) Response {
 	return Response{
@@ -22,6 +43,36 @@ func postgresErrorResponse(statusCode int, errorCode, message string) Response {
 		Body: map[string]string{
 			"error_code": errorCode,
 			"message":    message,
+		},
+	}
+}
+
+// postgresManagedByParentErrorResponse creates a 400 BAD_REQUEST response that
+// mirrors the real backend's "managed by parent" payload — including the
+// details[].ErrorInfo.metadata.declarative_context=MANAGED_BY_PARENT marker
+// that declarative clients (TF provider, direct engine) use to disregard the
+// delete and rely on the parent to cascade.
+func postgresManagedByParentErrorResponse(message string) Response {
+	return Response{
+		StatusCode: 400,
+		Body: map[string]any{
+			"error_code": "BAD_REQUEST",
+			"message":    message,
+			"details": []any{
+				map[string]any{
+					"@type":  "type.googleapis.com/google.rpc.ErrorInfo",
+					"domain": "databricks.com",
+					"reason": "RESOURCE_CONFLICT",
+					"metadata": map[string]string{
+						"declarative_context": "MANAGED_BY_PARENT",
+					},
+				},
+				map[string]any{
+					"@type":        "type.googleapis.com/google.rpc.RequestInfo",
+					"request_id":   nextUUID(),
+					"serving_data": "",
+				},
+			},
 		},
 	}
 }
@@ -67,28 +118,47 @@ func (s *FakeWorkspace) PostgresProjectCreate(req Request, projectID string) Res
 
 	now := nowTime()
 	project.Name = name
+	project.ProjectId = projectID
 	project.Uid = nextUUID()
 	project.CreateTime = now
 	project.UpdateTime = now
 
 	// Copy spec fields to status (API returns status as materialized view)
 	if project.Spec != nil {
+		// The backend materializes a default retention when the spec omits it.
+		historyRetention := project.Spec.HistoryRetentionDuration
+		if historyRetention == nil {
+			historyRetention = duration.New(defaultHistoryRetention)
+		}
+
 		project.Status = &postgres.ProjectStatus{
+			ProjectId:                   projectID,
 			DefaultBranch:               name + "/branches/production",
 			DisplayName:                 project.Spec.DisplayName,
 			PgVersion:                   project.Spec.PgVersion,
-			HistoryRetentionDuration:    project.Spec.HistoryRetentionDuration,
-			EnablePgNativeLogin:         true,
+			HistoryRetentionDuration:    historyRetention,
+			EnablePgNativeLogin:         false,
 			Owner:                       TestUser.UserName,
 			BranchLogicalSizeLimitBytes: 8796093022208, // 8 TB (real API default)
 			SyntheticStorageSizeBytes:   0,
-			ForceSendFields:             []string{"SyntheticStorageSizeBytes"},
+			ForceSendFields:             []string{"EnablePgNativeLogin", "SyntheticStorageSizeBytes"},
+		}
+
+		// The backend materializes default endpoint settings when the spec omits them.
+		project.Status.DefaultEndpointSettings = &postgres.ProjectDefaultEndpointSettings{
+			AutoscalingLimitMinCu:  defaultAutoscalingLimitMinCu,
+			AutoscalingLimitMaxCu:  defaultAutoscalingLimitMaxCu,
+			SuspendTimeoutDuration: duration.New(defaultSuspendTimeout),
 		}
 		if project.Spec.DefaultEndpointSettings != nil {
-			project.Status.DefaultEndpointSettings = &postgres.ProjectDefaultEndpointSettings{
-				AutoscalingLimitMinCu:  project.Spec.DefaultEndpointSettings.AutoscalingLimitMinCu,
-				AutoscalingLimitMaxCu:  project.Spec.DefaultEndpointSettings.AutoscalingLimitMaxCu,
-				SuspendTimeoutDuration: project.Spec.DefaultEndpointSettings.SuspendTimeoutDuration,
+			if project.Spec.DefaultEndpointSettings.AutoscalingLimitMinCu != 0 {
+				project.Status.DefaultEndpointSettings.AutoscalingLimitMinCu = project.Spec.DefaultEndpointSettings.AutoscalingLimitMinCu
+			}
+			if project.Spec.DefaultEndpointSettings.AutoscalingLimitMaxCu != 0 {
+				project.Status.DefaultEndpointSettings.AutoscalingLimitMaxCu = project.Spec.DefaultEndpointSettings.AutoscalingLimitMaxCu
+			}
+			if project.Spec.DefaultEndpointSettings.SuspendTimeoutDuration != nil {
+				project.Status.DefaultEndpointSettings.SuspendTimeoutDuration = project.Spec.DefaultEndpointSettings.SuspendTimeoutDuration
 			}
 		}
 		// Clear spec so it's not returned in response (API only returns status)
@@ -137,6 +207,10 @@ func (s *FakeWorkspace) PostgresProjectList() Response {
 
 // PostgresProjectUpdate updates a postgres project.
 func (s *FakeWorkspace) PostgresProjectUpdate(req Request, name string) Response {
+	if resp := validateUpdateMask(req, projectUpdateMaskPaths, projectOneofGroups); resp != nil {
+		return *resp
+	}
+
 	defer s.LockUnlock()()
 
 	project, exists := s.PostgresProjects[name]
@@ -162,6 +236,12 @@ func (s *FakeWorkspace) PostgresProjectUpdate(req Request, name string) Response
 		if updateProject.Spec.DisplayName != "" {
 			project.Status.DisplayName = updateProject.Spec.DisplayName
 		}
+		// Verified against a real workspace: dropping the field from config sends a
+		// mask naming it with no value in the body, and the API keeps the previous
+		// value rather than clearing it. So a removal never takes effect.
+		if updateProject.Spec.HistoryRetentionDuration != nil {
+			project.Status.HistoryRetentionDuration = updateProject.Spec.HistoryRetentionDuration
+		}
 		if updateProject.Spec.DefaultEndpointSettings != nil {
 			if project.Status.DefaultEndpointSettings == nil {
 				project.Status.DefaultEndpointSettings = &postgres.ProjectDefaultEndpointSettings{}
@@ -172,23 +252,59 @@ func (s *FakeWorkspace) PostgresProjectUpdate(req Request, name string) Response
 			if updateProject.Spec.DefaultEndpointSettings.AutoscalingLimitMaxCu != 0 {
 				project.Status.DefaultEndpointSettings.AutoscalingLimitMaxCu = updateProject.Spec.DefaultEndpointSettings.AutoscalingLimitMaxCu
 			}
+			if updateProject.Spec.DefaultEndpointSettings.SuspendTimeoutDuration != nil {
+				project.Status.DefaultEndpointSettings.SuspendTimeoutDuration = updateProject.Spec.DefaultEndpointSettings.SuspendTimeoutDuration
+			}
 		}
 	}
 
 	project.UpdateTime = nowTime()
 	s.PostgresProjects[name] = project
 
+	// Whole-spec mask + a body that omits default_endpoint_settings, while the stored
+	// settings are non-default, makes the real API 500 ("could not be processed"): it
+	// resets the message and the emptied autoscaling limits fail validation. The other
+	// masked fields are applied first, though — the failure is a partial write, so the
+	// mutation above is persisted and only this response reports the error. When the
+	// settings are already default, or the message is masked by its own path, the
+	// omission is tolerated. Probed against a real workspace 2026-09-21.
+	if wholeSpecMasked(req.URL.Query().Get("update_mask")) &&
+		(updateProject.Spec == nil || updateProject.Spec.DefaultEndpointSettings == nil) &&
+		project.Status != nil && isNonDefaultEndpointSettings(project.Status.DefaultEndpointSettings) {
+		return postgresErrorResponse(500, "INTERNAL_ERROR",
+			fmt.Sprintf("The request could not be processed. Please try again later and contact Databricks if the problem persists. [TraceId: %s]", nextTraceID()))
+	}
+
 	return Response{
 		Body: s.createOperationLocked(project.Name, project),
 	}
 }
 
-// PostgresProjectDelete deletes a postgres project.
+// PostgresProjectDelete deletes a postgres project. The `purge` query parameter
+// is ignored: acceptance tests assert on the recorded HTTP request rather than
+// on retention semantics, so a single "remove from map" action serves both
+// hard- and soft-delete paths.
 func (s *FakeWorkspace) PostgresProjectDelete(name string) Response {
 	defer s.LockUnlock()()
 
 	if _, exists := s.PostgresProjects[name]; !exists {
 		return postgresNotFoundResponse("project")
+	}
+
+	// Deleting a project cascade-deletes all its branches and endpoints.
+	branchPrefix := name + "/branches/"
+	for brName := range s.PostgresBranches {
+		if strings.HasPrefix(brName, branchPrefix) {
+			delete(s.PostgresBranches, brName)
+			delete(s.postgresImplicitBranches, brName)
+			endpointPrefix := brName + "/endpoints/"
+			for epName := range s.PostgresEndpoints {
+				if strings.HasPrefix(epName, endpointPrefix) {
+					delete(s.PostgresEndpoints, epName)
+					delete(s.postgresImplicitEndpoints, epName)
+				}
+			}
+		}
 	}
 
 	delete(s.PostgresProjects, name)
@@ -199,7 +315,11 @@ func (s *FakeWorkspace) PostgresProjectDelete(name string) Response {
 }
 
 // PostgresBranchCreate creates a new postgres branch.
-func (s *FakeWorkspace) PostgresBranchCreate(req Request, parent, branchID string) Response {
+//
+// When replaceExisting is true, an existing branch with the same ID is updated
+// in place instead of returning ALREADY_EXISTS. This mirrors the backend behavior
+// that lets users bring the implicitly-created production branch under management.
+func (s *FakeWorkspace) PostgresBranchCreate(req Request, parent, branchID string, replaceExisting bool) Response {
 	defer s.LockUnlock()()
 
 	// Validate that branch_id is provided
@@ -224,49 +344,65 @@ func (s *FakeWorkspace) PostgresBranchCreate(req Request, parent, branchID strin
 
 	name := fmt.Sprintf("%s/branches/%s", parent, branchID)
 
-	// Check for duplicate
-	if _, exists := s.PostgresBranches[name]; exists {
+	existing, exists := s.PostgresBranches[name]
+	if exists && !replaceExisting {
 		return postgresErrorResponse(409, "ALREADY_EXISTS", "branch with such id already exists")
 	}
 
 	now := nowTime()
-	branch.Name = name
-	branch.Parent = parent
-	branch.Uid = "br-" + nextUUID()[:20]
-	branch.CreateTime = now
-	branch.UpdateTime = now
+	branch.BranchId = branchID
+	if exists {
+		// Preserve identifying / output-only fields; apply incoming spec to status.
+		branch.Name = existing.Name
+		branch.Parent = existing.Parent
+		branch.Uid = existing.Uid
+		branch.CreateTime = existing.CreateTime
+		branch.UpdateTime = now
+		branch.Status = existing.Status
+	} else {
+		branch.Name = name
+		branch.Parent = parent
+		branch.Uid = "br-" + nextUUID()[:20]
+		branch.CreateTime = now
+		branch.UpdateTime = now
+		branch.Status = &postgres.BranchStatus{
+			BranchId:         branchID,
+			CurrentState:     postgres.BranchStatusStateReady,
+			StateChangeTime:  now,
+			Default:          false,
+			IsProtected:      false,
+			LogicalSizeBytes: 0,
+			ForceSendFields:  []string{"Default", "IsProtected", "LogicalSizeBytes"},
+		}
 
-	// Find the default branch to use as source
-	var defaultBranch *postgres.Branch
-	prefix := parent + "/branches/"
-	for brName, br := range s.PostgresBranches {
-		if strings.HasPrefix(brName, prefix) && br.Status != nil && br.Status.Default {
-			defaultBranch = &br
-			break
+		// Set source branch info if a default branch exists.
+		prefix := parent + "/branches/"
+		for brName, br := range s.PostgresBranches {
+			if strings.HasPrefix(brName, prefix) && br.Status != nil && br.Status.Default {
+				branch.Status.SourceBranch = br.Name
+				branch.Status.SourceBranchLsn = "0/0"
+				branch.Status.SourceBranchTime = nowTime()
+				break
+			}
 		}
 	}
 
-	// Initialize status with all required fields
-	branch.Status = &postgres.BranchStatus{
-		CurrentState:     postgres.BranchStatusStateReady,
-		StateChangeTime:  now,
-		Default:          false,
-		IsProtected:      false,
-		LogicalSizeBytes: 0,
-		ForceSendFields:  []string{"Default", "IsProtected", "LogicalSizeBytes"},
-	}
-
-	// Set source branch info if a default branch exists
-	if defaultBranch != nil {
-		branch.Status.SourceBranch = defaultBranch.Name
-		branch.Status.SourceBranchLsn = "0/0"
-		branch.Status.SourceBranchTime = nowTime()
+	// Apply user-provided spec fields to status (where input fields are surfaced).
+	if branch.Spec != nil {
+		branch.Status.IsProtected = branch.Spec.IsProtected
+		branch.Status.ExpireTime = branch.Spec.ExpireTime
 	}
 
 	// Clear spec - API only returns status
 	branch.Spec = nil
 
 	s.PostgresBranches[name] = branch
+
+	// Each branch implicitly provisions a primary read-write endpoint. Only create
+	// it on first branch creation; on replace_existing the primary already exists.
+	if !exists {
+		s.createDefaultEndpointLocked(name)
+	}
 
 	return Response{
 		Body: s.createOperationLocked(branch.Name, branch),
@@ -322,6 +458,10 @@ func (s *FakeWorkspace) PostgresBranchList(parent string) Response {
 
 // PostgresBranchUpdate updates a postgres branch.
 func (s *FakeWorkspace) PostgresBranchUpdate(req Request, name string) Response {
+	if resp := validateUpdateMask(req, branchUpdateMaskPaths, branchOneofGroups); resp != nil {
+		return *resp
+	}
+
 	defer s.LockUnlock()()
 
 	branch, exists := s.PostgresBranches[name]
@@ -345,6 +485,9 @@ func (s *FakeWorkspace) PostgresBranchUpdate(req Request, name string) Response 
 			branch.Status = &postgres.BranchStatus{}
 		}
 		branch.Status.IsProtected = updateBranch.Spec.IsProtected
+		if updateBranch.Spec.ExpireTime != nil {
+			branch.Status.ExpireTime = updateBranch.Spec.ExpireTime
+		}
 	}
 
 	branch.UpdateTime = nowTime()
@@ -355,7 +498,10 @@ func (s *FakeWorkspace) PostgresBranchUpdate(req Request, name string) Response 
 	}
 }
 
-// PostgresBranchDelete deletes a postgres branch.
+// PostgresBranchDelete deletes a postgres branch. The `purge` query parameter
+// is ignored: acceptance tests assert on the recorded HTTP request rather than
+// on retention semantics, so a single "remove from map" action serves both
+// hard- and soft-delete paths.
 func (s *FakeWorkspace) PostgresBranchDelete(name string) Response {
 	defer s.LockUnlock()()
 
@@ -364,20 +510,109 @@ func (s *FakeWorkspace) PostgresBranchDelete(name string) Response {
 		return postgresNotFoundResponse("branch")
 	}
 
-	// Check if branch is protected
 	if branch.Status != nil && branch.Status.IsProtected {
 		return postgresErrorResponse(400, "BAD_REQUEST", "cannot delete protected branch")
 	}
 
+	// Branches the server provisioned implicitly (the project's root branch)
+	// cannot be deleted independently; they are removed when the project is
+	// deleted. Matches the real backend's error payload including the
+	// declarative_context=MANAGED_BY_PARENT marker.
+	if s.postgresImplicitBranches[name] {
+		return postgresManagedByParentErrorResponse(fmt.Sprintf("Cannot delete root branch '%s'. Root branches cannot be deleted independently.", name))
+	}
+
+	// Deleting a branch cascade-deletes its endpoints (including the implicit
+	// primary).
+	endpointPrefix := name + "/endpoints/"
+	for epName := range s.PostgresEndpoints {
+		if strings.HasPrefix(epName, endpointPrefix) {
+			delete(s.PostgresEndpoints, epName)
+			delete(s.postgresImplicitEndpoints, epName)
+		}
+	}
+
 	delete(s.PostgresBranches, name)
+	delete(s.postgresImplicitBranches, name)
 
 	return Response{
 		Body: s.createOperationLocked(name, nil),
 	}
 }
 
+var snapshotScheduleUpdateMaskPaths = []string{"schedule"}
+
+// PostgresSnapshotScheduleGet retrieves a branch's snapshot schedule. The
+// schedule is intrinsic to the branch: for a branch that never had one set, the
+// API returns an empty schedule rather than 404, so the fake mirrors that.
+func (s *FakeWorkspace) PostgresSnapshotScheduleGet(name string) Response {
+	defer s.LockUnlock()()
+
+	branchName := strings.TrimSuffix(name, "/snapshot-schedule")
+	if _, exists := s.PostgresBranches[branchName]; !exists {
+		return postgresNotFoundResponse("branch")
+	}
+
+	schedule, exists := s.PostgresSnapshotSchedules[name]
+	if !exists {
+		schedule = postgres.SnapshotSchedule{Name: name}
+	}
+
+	return Response{
+		Body: schedule,
+	}
+}
+
+// PostgresSnapshotScheduleUpdate sets a branch's snapshot schedule. There is no
+// create/delete endpoint; the schedule is managed entirely through this update.
+// An empty schedule set disables automatic snapshots.
+func (s *FakeWorkspace) PostgresSnapshotScheduleUpdate(req Request, name string) Response {
+	if resp := validateUpdateMask(req, snapshotScheduleUpdateMaskPaths, nil); resp != nil {
+		return *resp
+	}
+
+	defer s.LockUnlock()()
+
+	branchName := strings.TrimSuffix(name, "/snapshot-schedule")
+	branch, exists := s.PostgresBranches[branchName]
+	if !exists {
+		return postgresNotFoundResponse("branch")
+	}
+
+	// Snapshots are only allowed on the root (default) branch; the backend
+	// rejects a schedule on any branch created off another.
+	if branch.Status == nil || !branch.Status.Default {
+		return postgresErrorResponse(400, "BAD_REQUEST", "not allowed to snapshot non-root branch")
+	}
+
+	var updateSchedule postgres.SnapshotSchedule
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &updateSchedule); err != nil {
+			return Response{
+				StatusCode: 400,
+				Body:       fmt.Sprintf("cannot unmarshal request body: %v", err),
+			}
+		}
+	}
+
+	schedule := postgres.SnapshotSchedule{
+		Name:     name,
+		Schedule: updateSchedule.Schedule,
+	}
+	s.PostgresSnapshotSchedules[name] = schedule
+
+	return Response{
+		Body: s.createOperationLocked(name, schedule),
+	}
+}
+
 // PostgresEndpointCreate creates a new postgres endpoint.
-func (s *FakeWorkspace) PostgresEndpointCreate(req Request, parent, endpointID string) Response {
+//
+// When replaceExisting is true, an existing endpoint with the same ID is updated
+// in place instead of returning ALREADY_EXISTS. This mirrors the backend behavior
+// that lets users bring the implicitly-created primary read-write endpoint under
+// management.
+func (s *FakeWorkspace) PostgresEndpointCreate(req Request, parent, endpointID string, replaceExisting bool) Response {
 	defer s.LockUnlock()()
 
 	// Validate that endpoint_id is provided
@@ -403,36 +638,57 @@ func (s *FakeWorkspace) PostgresEndpointCreate(req Request, parent, endpointID s
 
 	name := fmt.Sprintf("%s/endpoints/%s", parent, endpointID)
 
-	// Check for duplicate
-	if _, exists := s.PostgresEndpoints[name]; exists {
+	existing, exists := s.PostgresEndpoints[name]
+	if exists && !replaceExisting {
 		return postgresErrorResponse(409, "ALREADY_EXISTS", "endpoint with such id already exists")
 	}
 
 	now := nowTime()
-	endpoint.Name = name
-	endpoint.Parent = parent
-	endpoint.Uid = "ep-" + nextUUID()[:20]
-	endpoint.CreateTime = now
-	endpoint.UpdateTime = now
+	endpoint.EndpointId = endpointID
+	if exists {
+		endpoint.Name = existing.Name
+		endpoint.Parent = existing.Parent
+		endpoint.Uid = existing.Uid
+		endpoint.CreateTime = existing.CreateTime
+		endpoint.UpdateTime = now
+		endpoint.Status = existing.Status
+	} else {
+		endpoint.Name = name
+		endpoint.Parent = parent
+		endpoint.Uid = "ep-" + nextUUID()[:20]
+		endpoint.CreateTime = now
+		endpoint.UpdateTime = now
 
-	// Get default suspend timeout from project
-	var defaultSuspendTimeout *duration.Duration
-	if project, ok := s.PostgresProjects[branch.Parent]; ok {
-		if project.Status != nil && project.Status.DefaultEndpointSettings != nil {
-			defaultSuspendTimeout = project.Status.DefaultEndpointSettings.SuspendTimeoutDuration
+		// Inherit suspend timeout default from the project.
+		var defaultSuspendTimeout *duration.Duration
+		if project, ok := s.PostgresProjects[branch.Parent]; ok {
+			if project.Status != nil && project.Status.DefaultEndpointSettings != nil {
+				defaultSuspendTimeout = project.Status.DefaultEndpointSettings.SuspendTimeoutDuration
+			}
+		}
+
+		endpoint.Status = &postgres.EndpointStatus{
+			EndpointId:             endpointID,
+			CurrentState:           postgres.EndpointStatusStateActive,
+			Disabled:               false,
+			Settings:               &postgres.EndpointSettings{},
+			SuspendTimeoutDuration: defaultSuspendTimeout,
+			ForceSendFields:        []string{"Disabled"},
+		}
+
+		host := endpoint.Uid + ".database.us-east-1.cloud.databricks.com"
+		endpoint.Status.Hosts = &postgres.EndpointHosts{
+			Host:         host,
+			ReadOnlyHost: host,
+		}
+		endpoint.Status.Group = &postgres.EndpointGroupStatus{
+			EnableReadableSecondaries: true,
+			Max:                       1,
+			Min:                       1,
 		}
 	}
 
-	// Initialize status with all required fields
-	endpoint.Status = &postgres.EndpointStatus{
-		CurrentState:           postgres.EndpointStatusStateActive,
-		Disabled:               false,
-		Settings:               &postgres.EndpointSettings{},
-		SuspendTimeoutDuration: defaultSuspendTimeout,
-		ForceSendFields:        []string{"Disabled"},
-	}
-
-	// Copy spec values to status
+	// Apply user-provided spec to status (where input fields are surfaced).
 	if endpoint.Spec != nil {
 		endpoint.Status.EndpointType = endpoint.Spec.EndpointType
 		endpoint.Status.AutoscalingLimitMinCu = endpoint.Spec.AutoscalingLimitMinCu
@@ -440,23 +696,7 @@ func (s *FakeWorkspace) PostgresEndpointCreate(req Request, parent, endpointID s
 		if endpoint.Spec.SuspendTimeoutDuration != nil {
 			endpoint.Status.SuspendTimeoutDuration = endpoint.Spec.SuspendTimeoutDuration
 		}
-		if endpoint.Spec.Disabled {
-			endpoint.Status.Disabled = true
-		}
-	}
-
-	// Generate fake hosts
-	host := endpoint.Uid + ".database.us-east-1.cloud.databricks.com"
-	endpoint.Status.Hosts = &postgres.EndpointHosts{
-		Host:         host,
-		ReadOnlyHost: host,
-	}
-
-	// Set default group status
-	endpoint.Status.Group = &postgres.EndpointGroupStatus{
-		EnableReadableSecondaries: true,
-		Max:                       1,
-		Min:                       1,
+		endpoint.Status.Disabled = endpoint.Spec.Disabled
 	}
 
 	// Clear spec - API only returns status
@@ -526,7 +766,311 @@ func (s *FakeWorkspace) PostgresEndpointList(parent string) Response {
 }
 
 // PostgresEndpointUpdate updates a postgres endpoint.
+// The update_mask paths each postgres Update accepts, as probed against the real
+// API. The backend rejects anything else with 400, most notably the members of a
+// oneof: it masks them together under the group name and refuses the individual
+// field names. Without these lists the fake accepts any mask and hides that class
+// of bug until a cloud run.
+var endpointUpdateMaskPaths = []string{
+	// The Terraform provider masks the whole spec and sends every field in the
+	// body; the API accepts that.
+	"spec",
+
+	"spec.autoscaling_limit_max_cu",
+	"spec.autoscaling_limit_min_cu",
+	"spec.disabled",
+	"spec.group.enable_readable_secondaries",
+	"spec.group.max",
+	"spec.group.min",
+
+	// A message is maskable on its own, which is how a bundle that adds a whole
+	// settings block reaches the API. Probed on a real endpoint 2026-08-31: both
+	// spec.settings and spec.settings.pg_settings get past mask validation.
+	"spec.settings",
+	"spec.settings.pg_settings",
+
+	"spec.suspension",
+}
+
+var branchUpdateMaskPaths = []string{
+	// The Terraform provider masks the whole spec.
+	"spec",
+
+	"spec.is_protected",
+
+	// expire_time, no_expiry and ttl are three sides of one oneof.
+	"spec.expiration",
+}
+
+var projectUpdateMaskPaths = []string{
+	// The Terraform provider masks the whole spec plus both initial_* specs.
+	"spec",
+	"initial_branch_spec",
+	"initial_endpoint_spec",
+
+	"spec.budget_policy_id",
+	"spec.custom_tags",
+	"spec.default_branch",
+	"spec.default_endpoint_settings",
+	"spec.default_endpoint_settings.autoscaling_limit_max_cu",
+	"spec.default_endpoint_settings.autoscaling_limit_min_cu",
+	"spec.default_endpoint_settings.pg_settings",
+	"spec.display_name",
+	"spec.enable_pg_native_login",
+	"spec.history_retention_duration",
+
+	// default_endpoint_settings.no_suspension and .suspend_timeout_duration are
+	// two sides of one oneof.
+	"spec.default_endpoint_settings.suspension",
+}
+
+// The oneof groups under each spec, mapped to the body fields that can populate them.
+// A mask that names a message expands to the oneof groups beneath it, and each of those
+// must be populated in the request body, even though a plain optional field beneath the
+// same message may be omitted. Probed against a real workspace on 2026-08-31:
+// update_mask=spec.default_endpoint_settings with a body carrying only the autoscaling
+// limits is rejected with "Field 'spec.default_endpoint_settings.suspension' is in
+// update_mask but not provided in request", while the equally absent pg_settings under
+// the same message is tolerated.
+var endpointOneofGroups = map[string][]string{
+	"spec.suspension": {"spec.no_suspension", "spec.suspend_timeout_duration"},
+}
+
+var branchOneofGroups = map[string][]string{
+	"spec.expiration": {"spec.expire_time", "spec.no_expiry", "spec.ttl"},
+}
+
+var projectOneofGroups = map[string][]string{
+	"spec.default_endpoint_settings.suspension": {
+		"spec.default_endpoint_settings.no_suspension",
+		"spec.default_endpoint_settings.suspend_timeout_duration",
+	},
+}
+
+// unpopulatedOneofGroup returns the first oneof group the mask covers but the body does
+// not populate.
+//
+// Only two mask shapes are known to require a group: the group itself, and the nested
+// message directly enclosing it. Masking the top-level spec does not, at either depth.
+// All three were probed against a real workspace on 2026-08-31:
+//
+//	spec.default_endpoint_settings           rejects a body without a suspension field
+//	spec (project, one level above that)     accepts it
+//	spec (endpoint, suspension right below)  accepts it
+//
+// So the rule is not "every group under the mask" and not "every group one level under
+// the mask" either. Rather than guess at the real shape, this only reproduces what was
+// measured; widen it when there is a probe to back the wider rule.
+func unpopulatedOneofGroup(mask string, body map[string]any, groups map[string][]string) string {
+	for group, members := range groups {
+		if !maskCovers(mask, group) {
+			continue
+		}
+		populated := false
+		for _, member := range members {
+			if bodyHasPath(body, strings.Split(member, ".")) {
+				populated = true
+				break
+			}
+		}
+		if !populated {
+			return group
+		}
+	}
+	return ""
+}
+
+func maskCovers(mask, path string) bool {
+	for entry := range strings.SplitSeq(mask, ",") {
+		entry = strings.TrimSpace(entry)
+		// A nested message only: masking the top-level spec does not pull in groups.
+		if entry == path || (entry == parentPath(path) && strings.Contains(entry, ".")) {
+			return true
+		}
+	}
+	return false
+}
+
+// parentPath returns path with its last segment removed, or "" when it has only one.
+func parentPath(path string) string {
+	before, _, ok := strings.CutLast(path, ".")
+	if !ok {
+		return ""
+	}
+	return before
+}
+
+// missingMaskedField returns the first update_mask path the API would reject
+// because the mask names it but the request body carries no value for it, which is
+// how a removal from bundle config reaches the API. Verified against a real
+// workspace: "Field 'spec.history_retention_duration' is in update_mask but not
+// provided in request".
+func missingMaskedField(req Request, oneofGroups map[string][]string) string {
+	mask := req.URL.Query().Get("update_mask")
+	if mask == "" || len(req.Body) == 0 {
+		return ""
+	}
+	var body map[string]any
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		return ""
+	}
+	for path := range strings.SplitSeq(mask, ",") {
+		path = strings.TrimSpace(path)
+		if _, ok := oneofGroups[path]; ok {
+			// A group is not a body field of its own; a member populates it instead, which
+			// unpopulatedOneofGroup checks.
+			continue
+		}
+		parts := strings.Split(path, ".")
+		if path == "" || path == "*" || len(parts) < 2 {
+			// A whole message the request omits is tolerated: the Terraform provider
+			// masks initial_branch_spec and initial_endpoint_spec without sending
+			// either, and the API accepts that.
+			continue
+		}
+		// Only a field whose parent the request does carry must itself be present.
+		if bodyHasPath(body, parts[:len(parts)-1]) && !bodyHasPath(body, parts) {
+			return path
+		}
+	}
+	return ""
+}
+
+func bodyHasPath(node any, parts []string) bool {
+	for _, part := range parts {
+		m, ok := node.(map[string]any)
+		if !ok {
+			return false
+		}
+		node, ok = m[part]
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func missingMaskedFieldResponse(path string) Response {
+	return postgresErrorResponse(400, "INVALID_PARAMETER_VALUE", fmt.Sprintf("Field '%s' is in update_mask but not provided in request", path))
+}
+
+// validateUpdateMask mirrors the API's rejection of unknown update_mask paths.
+// Returns nil when every path is accepted.
+func validateUpdateMask(req Request, allowed []string, oneofGroups map[string][]string) *Response {
+	mask := req.URL.Query().Get("update_mask")
+	if mask == "" {
+		return nil
+	}
+	wildcard := false
+	for path := range strings.SplitSeq(mask, ",") {
+		path = strings.TrimSpace(path)
+		if path == "*" {
+			// The API accepts the wildcard, then requires every field populated;
+			// see wildcardMissingField.
+			wildcard = true
+			continue
+		}
+		if path == "" || slices.Contains(allowed, path) {
+			continue
+		}
+		resp := postgresErrorResponse(400, "INVALID_PARAMETER_VALUE", fmt.Sprintf("Unknown field path in update_mask: '%s'", path))
+		return &resp
+	}
+	var body map[string]any
+	_ = json.Unmarshal(req.Body, &body)
+	if wildcard {
+		if path := wildcardMissingField(body, allowed, oneofGroups); path != "" {
+			resp := missingMaskedFieldResponse(path)
+			return &resp
+		}
+		return nil
+	}
+	// An unknown path is reported ahead of a missing one, matching the API.
+	if path := missingMaskedField(req, oneofGroups); path != "" {
+		resp := missingMaskedFieldResponse(path)
+		return &resp
+	}
+	if group := unpopulatedOneofGroup(mask, body, oneofGroups); group != "" {
+		resp := missingMaskedFieldResponse(group)
+		return &resp
+	}
+	return nil
+}
+
+// wholeSpecMasked reports whether the update_mask names the whole spec message (a bare
+// "spec" path), as the Terraform provider does.
+func wholeSpecMasked(mask string) bool {
+	for path := range strings.SplitSeq(mask, ",") {
+		if strings.TrimSpace(path) == "spec" {
+			return true
+		}
+	}
+	return false
+}
+
+// isNonDefaultEndpointSettings reports whether the settings differ from what create
+// materializes by default (autoscaling 1..1, 86400s suspend).
+func isNonDefaultEndpointSettings(s *postgres.ProjectDefaultEndpointSettings) bool {
+	if s == nil {
+		return false
+	}
+	if s.AutoscalingLimitMinCu != defaultAutoscalingLimitMinCu || s.AutoscalingLimitMaxCu != defaultAutoscalingLimitMaxCu {
+		return true
+	}
+	return s.SuspendTimeoutDuration != nil && s.SuspendTimeoutDuration.AsDuration() != defaultSuspendTimeout
+}
+
+// wildcardMissingField returns the first spec field that update_mask=* requires but the
+// body does not carry. The wildcard expands to every settable leaf, and — unlike a bare
+// message mask — the API then demands each one be present (probed against a real
+// workspace: * with a create-shaped body is rejected field by field). The required set is
+// the leaf paths of `allowed`: an entry with no more-specific entry beneath it, a oneof
+// group counting as satisfied by any of its members.
+func wildcardMissingField(body map[string]any, allowed []string, oneofGroups map[string][]string) string {
+	var required []string
+	for _, p := range allowed {
+		if !strings.HasPrefix(p, "spec.") {
+			// "spec" itself and the initial_* specs are not spec leaves.
+			continue
+		}
+		isParent := false
+		for _, q := range allowed {
+			if q != p && strings.HasPrefix(q, p+".") {
+				isParent = true
+				break
+			}
+		}
+		if !isParent {
+			required = append(required, p)
+		}
+	}
+	slices.Sort(required)
+	for _, p := range required {
+		if members, ok := oneofGroups[p]; ok {
+			satisfied := false
+			for _, m := range members {
+				if bodyHasPath(body, strings.Split(m, ".")) {
+					satisfied = true
+					break
+				}
+			}
+			if !satisfied {
+				return p
+			}
+			continue
+		}
+		if !bodyHasPath(body, strings.Split(p, ".")) {
+			return p
+		}
+	}
+	return ""
+}
+
 func (s *FakeWorkspace) PostgresEndpointUpdate(req Request, name string) Response {
+	if resp := validateUpdateMask(req, endpointUpdateMaskPaths, endpointOneofGroups); resp != nil {
+		return *resp
+	}
+
 	defer s.LockUnlock()()
 
 	endpoint, exists := s.PostgresEndpoints[name]
@@ -577,7 +1121,589 @@ func (s *FakeWorkspace) PostgresEndpointDelete(name string) Response {
 		return postgresNotFoundResponse("endpoint")
 	}
 
+	// Endpoints the server provisioned implicitly (the primary read-write
+	// endpoint on every branch) cannot be deleted independently; they are
+	// removed when the parent branch is deleted. Matches the real backend's
+	// error payload including the declarative_context=MANAGED_BY_PARENT marker.
+	if s.postgresImplicitEndpoints[name] {
+		return postgresManagedByParentErrorResponse(fmt.Sprintf("Cannot delete read-write endpoint '%s'. Read-write endpoints cannot be deleted.", name))
+	}
+
 	delete(s.PostgresEndpoints, name)
+	delete(s.postgresImplicitEndpoints, name)
+
+	return Response{
+		Body: s.createOperationLocked(name, nil),
+	}
+}
+
+// PostgresDatabaseCreate creates a new postgres database.
+//
+// When replaceExisting is true, an existing database with the same ID is updated
+// in place instead of returning ALREADY_EXISTS. This mirrors the backend behavior
+// that lets users bring an already-existing database under management.
+func (s *FakeWorkspace) PostgresDatabaseCreate(req Request, parent, databaseID string, replaceExisting bool) Response {
+	defer s.LockUnlock()()
+
+	if databaseID == "" {
+		return postgresErrorResponse(400, "INVALID_PARAMETER_VALUE", `Field 'database_id' is required, expected non-default value (not "")!`)
+	}
+
+	// Check if parent branch exists
+	if _, exists := s.PostgresBranches[parent]; !exists {
+		return postgresNotFoundResponse("branch")
+	}
+
+	var database postgres.Database
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &database); err != nil {
+			return Response{
+				StatusCode: 400,
+				Body:       fmt.Sprintf("cannot unmarshal request body: %v", err),
+			}
+		}
+	}
+
+	// The real Lakebase API requires the owning role on create and rejects an empty
+	// one with this exact error (verified on aws-ucws 2026-07-13). The fake does
+	// not synthesize a default, matching that behavior.
+	if database.Spec == nil || database.Spec.Role == "" {
+		return postgresErrorResponse(400, "INVALID_PARAMETER_VALUE", `Field 'database.spec.role' is required, expected non-default value (not "")!`)
+	}
+
+	name := fmt.Sprintf("%s/databases/%s", parent, databaseID)
+
+	existing, exists := s.PostgresDatabases[name]
+	if exists && !replaceExisting {
+		// The real Lakebase API returns 400 BAD_REQUEST (not 409) for a duplicate
+		// create, the same as postgres_roles. Match it so the conflict a bundle hits
+		// on a pre-existing database looks the same.
+		return postgresErrorResponse(400, "BAD_REQUEST", "database with that name already exists")
+	}
+
+	now := nowTime()
+	if exists {
+		// Preserve identifying / output-only fields; apply incoming spec to status.
+		status := &postgres.DatabaseDatabaseStatus{
+			DatabaseId:       databaseID,
+			PostgresDatabase: database.Spec.PostgresDatabase,
+			Role:             database.Spec.Role,
+		}
+		existing.UpdateTime = now
+		existing.Status = status
+		existing.Spec = nil
+		s.PostgresDatabases[name] = existing
+
+		return Response{
+			Body: s.createOperationLocked(existing.Name, existing),
+		}
+	}
+
+	database.Name = name
+	database.DatabaseId = databaseID
+	database.Parent = parent
+	database.CreateTime = now
+	database.UpdateTime = now
+
+	// Mirror spec onto status; the real API only echoes Status on GET.
+	status := &postgres.DatabaseDatabaseStatus{
+		DatabaseId:       databaseID,
+		PostgresDatabase: database.Spec.PostgresDatabase,
+		Role:             database.Spec.Role,
+	}
+	database.Status = status
+	database.Spec = nil
+
+	s.PostgresDatabases[name] = database
+
+	return Response{
+		Body: s.createOperationLocked(database.Name, database),
+	}
+}
+
+// PostgresDatabaseGet retrieves a postgres database by name.
+func (s *FakeWorkspace) PostgresDatabaseGet(name string) Response {
+	defer s.LockUnlock()()
+
+	// Extract project and branch names from database name
+	// Format: projects/{project}/branches/{branch}/databases/{database}
+	parts := strings.Split(name, "/branches/")
+	if len(parts) == 2 {
+		projectName := parts[0]
+		if _, exists := s.PostgresProjects[projectName]; !exists {
+			return postgresNotFoundResponse("project")
+		}
+		branchParts := strings.Split(parts[1], "/databases/")
+		if len(branchParts) == 2 {
+			branchName := projectName + "/branches/" + branchParts[0]
+			if _, exists := s.PostgresBranches[branchName]; !exists {
+				return postgresNotFoundResponse("branch")
+			}
+		}
+	}
+
+	database, exists := s.PostgresDatabases[name]
+	if !exists {
+		return postgresNotFoundResponse("database")
+	}
+
+	return Response{
+		Body: database,
+	}
+}
+
+// PostgresDatabaseList lists all postgres databases for a branch.
+func (s *FakeWorkspace) PostgresDatabaseList(parent string) Response {
+	defer s.LockUnlock()()
+
+	if _, exists := s.PostgresBranches[parent]; !exists {
+		return postgresNotFoundResponse("branch")
+	}
+
+	var databases []postgres.Database
+	prefix := parent + "/databases/"
+	for name, d := range s.PostgresDatabases {
+		if strings.HasPrefix(name, prefix) {
+			databases = append(databases, d)
+		}
+	}
+
+	return Response{
+		Body: postgres.ListDatabasesResponse{
+			Databases: databases,
+		},
+	}
+}
+
+// PostgresDatabaseUpdate updates a postgres database.
+func (s *FakeWorkspace) PostgresDatabaseUpdate(req Request, name string) Response {
+	defer s.LockUnlock()()
+
+	database, exists := s.PostgresDatabases[name]
+	if !exists {
+		return postgresNotFoundResponse("database")
+	}
+
+	var updateDatabase postgres.Database
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &updateDatabase); err != nil {
+			return Response{
+				StatusCode: 400,
+				Body:       fmt.Sprintf("cannot unmarshal request body: %v", err),
+			}
+		}
+	}
+
+	if updateDatabase.Spec != nil {
+		// Preserve database_id which is derived from the resource name.
+		databaseID := ""
+		if database.Status != nil {
+			databaseID = database.Status.DatabaseId
+		}
+		var paths []string
+		if mask := req.URL.Query().Get("update_mask"); mask != "" {
+			paths = strings.Split(mask, ",")
+		}
+		database.Status = applyDatabaseSpecMask(database.Status, databaseStatusFromSpec(updateDatabase.Spec), paths)
+		database.Status.DatabaseId = databaseID
+	}
+
+	database.UpdateTime = nowTime()
+	s.PostgresDatabases[name] = database
+
+	return Response{
+		Body: s.createOperationLocked(database.Name, database),
+	}
+}
+
+// databaseStatusFromSpec mirrors the real Postgres Database server's behavior of
+// echoing the spec onto Status while leaving Spec=nil on GET responses.
+func databaseStatusFromSpec(spec *postgres.DatabaseDatabaseSpec) *postgres.DatabaseDatabaseStatus {
+	status := &postgres.DatabaseDatabaseStatus{}
+	if spec == nil {
+		return status
+	}
+	status.PostgresDatabase = spec.PostgresDatabase
+	status.Role = spec.Role
+	return status
+}
+
+// applyDatabaseSpecMask applies the fields named in paths (the update_mask) from
+// desired onto existing. Paths are relative to the Database and "spec."-prefixed;
+// the bare path "spec" replaces the whole subtree, and an empty paths slice
+// replaces everything. Same shape as applyRoleSpecMask.
+func applyDatabaseSpecMask(existing, desired *postgres.DatabaseDatabaseStatus, paths []string) *postgres.DatabaseDatabaseStatus {
+	if len(paths) == 0 || existing == nil {
+		return desired
+	}
+	result := *existing
+	for _, p := range paths {
+		field, _, _ := strings.Cut(strings.TrimPrefix(p, "spec."), ".")
+		switch field {
+		case "spec":
+			result = *desired
+		case "postgres_database":
+			result.PostgresDatabase = desired.PostgresDatabase
+		case "role":
+			result.Role = desired.Role
+		}
+	}
+	return &result
+}
+
+// PostgresDatabaseDelete deletes a postgres database.
+func (s *FakeWorkspace) PostgresDatabaseDelete(name string) Response {
+	defer s.LockUnlock()()
+
+	if _, exists := s.PostgresDatabases[name]; !exists {
+		return postgresNotFoundResponse("database")
+	}
+
+	delete(s.PostgresDatabases, name)
+
+	return Response{
+		Body: s.createOperationLocked(name, nil),
+	}
+}
+
+// PostgresCatalogCreate creates a new postgres catalog.
+func (s *FakeWorkspace) PostgresCatalogCreate(req Request, catalogID string) Response {
+	defer s.LockUnlock()()
+
+	if catalogID == "" {
+		return postgresErrorResponse(400, "INVALID_PARAMETER_VALUE", `Field 'catalog_id' is required, expected non-default value (not "")!`)
+	}
+
+	// The SDK sends request.Catalog (the inner struct) as the body — NOT a
+	// {"catalog": ...} wrapper. Unmarshal directly into postgres.Catalog.
+	var catalog postgres.Catalog
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &catalog); err != nil {
+			return Response{
+				StatusCode: 400,
+				Body:       fmt.Sprintf("cannot unmarshal request body: %v", err),
+			}
+		}
+	}
+
+	name := "catalogs/" + catalogID
+
+	if _, exists := s.PostgresCatalogs[name]; exists {
+		return postgresErrorResponse(409, "ALREADY_EXISTS", "catalog with such id already exists")
+	}
+
+	now := nowTime()
+	catalog.Name = name
+	catalog.CatalogId = catalogID
+	catalog.Uid = nextUUID()
+	catalog.CreateTime = now
+	catalog.UpdateTime = now
+
+	status := &postgres.CatalogCatalogStatus{}
+	if catalog.Spec != nil {
+		status.Branch = catalog.Spec.Branch
+		status.PostgresDatabase = catalog.Spec.PostgresDatabase
+		// Project portion of the status is "projects/{project_id}", derived
+		// from the branch name "projects/{project_id}/branches/{branch_id}".
+		if idx := strings.Index(catalog.Spec.Branch, "/branches/"); idx > 0 {
+			status.Project = catalog.Spec.Branch[:idx]
+		}
+	}
+	catalog.Status = status
+
+	// Real API only returns status on GET (no spec). Match that to keep
+	// acceptance test output stable between local and cloud.
+	catalog.Spec = nil
+
+	s.PostgresCatalogs[name] = catalog
+
+	return Response{Body: s.createOperationLocked(name, catalog)}
+}
+
+// PostgresCatalogGet retrieves a postgres catalog by name.
+func (s *FakeWorkspace) PostgresCatalogGet(name string) Response {
+	defer s.LockUnlock()()
+
+	catalog, exists := s.PostgresCatalogs[name]
+	if !exists {
+		return postgresNotFoundResponse("catalog")
+	}
+	return Response{Body: catalog}
+}
+
+// PostgresCatalogDelete deletes a postgres catalog.
+func (s *FakeWorkspace) PostgresCatalogDelete(name string) Response {
+	defer s.LockUnlock()()
+
+	if _, exists := s.PostgresCatalogs[name]; !exists {
+		return postgresNotFoundResponse("catalog")
+	}
+	delete(s.PostgresCatalogs, name)
+	return Response{Body: s.createOperationLocked(name, nil)}
+}
+
+// roleIDPattern matches a valid postgres role_id per RFC 1123: lowercase letters,
+// numbers and hyphens; 4-63 chars; must start with a letter.
+var roleIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{3,62}$`)
+
+// roleStatusFromSpec mirrors the real Postgres Role server's behavior of echoing
+// the spec onto Status (plus default-deriving fields the user did not specify)
+// while leaving Spec=nil on GET responses.
+func roleStatusFromSpec(spec *postgres.RoleRoleSpec) *postgres.RoleRoleStatus {
+	status := &postgres.RoleRoleStatus{}
+	if spec == nil {
+		return status
+	}
+	status.PostgresRole = spec.PostgresRole
+	status.MembershipRoles = spec.MembershipRoles
+	status.IdentityType = spec.IdentityType
+	if status.IdentityType == "" {
+		// Server returns IDENTITY_TYPE_UNSPECIFIED for plain Postgres roles.
+		status.IdentityType = "IDENTITY_TYPE_UNSPECIFIED"
+	}
+	status.AuthMethod = spec.AuthMethod
+	if status.AuthMethod == "" {
+		// Server derives auth_method from identity_type when the user omits it:
+		// see SDK comment on postgres.RoleRoleSpec.AuthMethod.
+		switch spec.IdentityType {
+		case postgres.RoleIdentityTypeGroup:
+			status.AuthMethod = postgres.RoleAuthMethodNoLogin
+		case postgres.RoleIdentityTypeUser, postgres.RoleIdentityTypeServicePrincipal:
+			status.AuthMethod = postgres.RoleAuthMethodLakebaseOauthV1
+		default:
+			status.AuthMethod = postgres.RoleAuthMethodPgPasswordScramSha256
+		}
+	}
+	// Real server always echoes an attributes block (all-false when unspecified).
+	attrs := &postgres.RoleAttributes{
+		ForceSendFields: []string{"Bypassrls", "Createdb", "Createrole"},
+	}
+	if spec.Attributes != nil {
+		attrs.Bypassrls = spec.Attributes.Bypassrls
+		attrs.Createdb = spec.Attributes.Createdb
+		attrs.Createrole = spec.Attributes.Createrole
+	}
+	status.Attributes = attrs
+	return status
+}
+
+// PostgresRoleCreate creates a new postgres role.
+//
+// When replaceExisting is true, an existing role with the same ID is updated in
+// place instead of returning ALREADY_EXISTS. This mirrors the backend behavior
+// that lets users bring an inherited/pre-existing role under management.
+func (s *FakeWorkspace) PostgresRoleCreate(req Request, parent, roleID string, replaceExisting bool) Response {
+	defer s.LockUnlock()()
+
+	// Check if parent branch exists
+	if _, exists := s.PostgresBranches[parent]; !exists {
+		return postgresNotFoundResponse("branch")
+	}
+
+	// When role_id is empty the real API generates one; mirror that here so the
+	// CLI's "let the server pick" path is exercised by tests.
+	if roleID == "" {
+		roleID = "role-" + nextUUID()[:8]
+	}
+	if !roleIDPattern.MatchString(roleID) {
+		return postgresErrorResponse(400, "INVALID_PARAMETER_VALUE",
+			`Field 'role_id' must be 4-63 characters, start with a lowercase letter, and contain only lowercase letters, numbers and hyphens (RFC 1123).`)
+	}
+
+	var role postgres.Role
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &role); err != nil {
+			return Response{
+				StatusCode: 400,
+				Body:       fmt.Sprintf("cannot unmarshal request body: %v", err),
+			}
+		}
+	}
+
+	name := fmt.Sprintf("%s/roles/%s", parent, roleID)
+
+	existing, exists := s.PostgresRoles[name]
+	if exists && !replaceExisting {
+		// The real Lakebase API returns 400 BAD_REQUEST (not 409) for a duplicate
+		// role, with this message (verified on dogfood 2026-06-10). Match it so the
+		// conflict a bundle hits on an inherited/pre-existing role looks the same.
+		return postgresErrorResponse(400, "BAD_REQUEST", "role with that name already exists")
+	}
+
+	now := nowTime()
+	if exists {
+		// Preserve identifying / output-only fields; apply incoming spec to status.
+		existing.UpdateTime = now
+		existing.Status = roleStatusFromSpec(role.Spec)
+		existing.Status.RoleId = roleID
+		existing.Spec = nil
+		s.PostgresRoles[name] = existing
+
+		return Response{
+			Body: s.createOperationLocked(existing.Name, existing),
+		}
+	}
+
+	role.Name = name
+	role.RoleId = roleID
+	role.Parent = parent
+	role.CreateTime = now
+	role.UpdateTime = now
+
+	role.Status = roleStatusFromSpec(role.Spec)
+	role.Status.RoleId = roleID
+	role.Spec = nil
+
+	s.PostgresRoles[name] = role
+
+	return Response{
+		Body: s.createOperationLocked(role.Name, role),
+	}
+}
+
+// PostgresRoleGet retrieves a postgres role by name.
+func (s *FakeWorkspace) PostgresRoleGet(name string) Response {
+	defer s.LockUnlock()()
+
+	// Extract project and branch names from role name
+	// Format: projects/{project}/branches/{branch}/roles/{role}
+	parts := strings.Split(name, "/branches/")
+	if len(parts) == 2 {
+		projectName := parts[0]
+		if _, exists := s.PostgresProjects[projectName]; !exists {
+			return postgresNotFoundResponse("project")
+		}
+		branchParts := strings.Split(parts[1], "/roles/")
+		if len(branchParts) == 2 {
+			branchName := projectName + "/branches/" + branchParts[0]
+			if _, exists := s.PostgresBranches[branchName]; !exists {
+				return postgresNotFoundResponse("branch")
+			}
+		}
+	}
+
+	role, exists := s.PostgresRoles[name]
+	if !exists {
+		return postgresNotFoundResponse("role")
+	}
+
+	return Response{
+		Body: role,
+	}
+}
+
+// PostgresRoleList lists all postgres roles for a branch.
+func (s *FakeWorkspace) PostgresRoleList(parent string) Response {
+	defer s.LockUnlock()()
+
+	if _, exists := s.PostgresBranches[parent]; !exists {
+		return postgresNotFoundResponse("branch")
+	}
+
+	var roles []postgres.Role
+	prefix := parent + "/roles/"
+	for name, r := range s.PostgresRoles {
+		if strings.HasPrefix(name, prefix) {
+			roles = append(roles, r)
+		}
+	}
+
+	return Response{
+		Body: postgres.ListRolesResponse{
+			Roles: roles,
+		},
+	}
+}
+
+// PostgresRoleUpdate updates a postgres role. The update_mask query parameter
+// selects which spec fields to apply; the request body always carries the full
+// desired spec. An empty update_mask updates all fields, matching the API
+// ("if unspecified, all fields will be updated when possible").
+func (s *FakeWorkspace) PostgresRoleUpdate(req Request, name string) Response {
+	defer s.LockUnlock()()
+
+	role, exists := s.PostgresRoles[name]
+	if !exists {
+		return postgresNotFoundResponse("role")
+	}
+
+	var updateRole postgres.Role
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &updateRole); err != nil {
+			return Response{
+				StatusCode: 400,
+				Body:       fmt.Sprintf("cannot unmarshal request body: %v", err),
+			}
+		}
+	}
+
+	if updateRole.Spec != nil {
+		// Preserve role_id which is derived from the resource name.
+		roleID := ""
+		if role.Status != nil {
+			roleID = role.Status.RoleId
+		}
+		var paths []string
+		if mask := req.URL.Query().Get("update_mask"); mask != "" {
+			paths = strings.Split(mask, ",")
+		}
+		role.Status = applyRoleSpecMask(role.Status, roleStatusFromSpec(updateRole.Spec), paths)
+		role.Status.RoleId = roleID
+	}
+
+	role.UpdateTime = nowTime()
+	s.PostgresRoles[name] = role
+
+	return Response{
+		Body: s.createOperationLocked(role.Name, role),
+	}
+}
+
+// applyRoleSpecMask applies the fields named in paths (the update_mask) from
+// desired onto existing. Paths are relative to the Role and "spec."-prefixed; the
+// bare path "spec" replaces the whole subtree, and an empty paths slice replaces
+// everything.
+//
+// A nested path such as "spec.attributes.createdb" is collapsed to its top-level
+// field ("attributes"), and that whole field is taken from desired. This is a
+// simplification: the real backend masks at the individual leaf (verified on
+// dogfood 2026-06-16 — update_mask=spec.attributes.createdb leaves the sibling
+// attributes untouched), but the direct engine always sends the full spec in the
+// request body, so the collapsed result is identical for the requests it makes.
+func applyRoleSpecMask(existing, desired *postgres.RoleRoleStatus, paths []string) *postgres.RoleRoleStatus {
+	if len(paths) == 0 || existing == nil {
+		return desired
+	}
+	result := *existing
+	for _, p := range paths {
+		field, _, _ := strings.Cut(strings.TrimPrefix(p, "spec."), ".")
+		switch field {
+		case "spec":
+			result = *desired
+		case "postgres_role":
+			result.PostgresRole = desired.PostgresRole
+		case "auth_method":
+			result.AuthMethod = desired.AuthMethod
+		case "identity_type":
+			result.IdentityType = desired.IdentityType
+		case "membership_roles":
+			result.MembershipRoles = desired.MembershipRoles
+		case "attributes":
+			result.Attributes = desired.Attributes
+		}
+	}
+	return &result
+}
+
+// PostgresRoleDelete deletes a postgres role.
+func (s *FakeWorkspace) PostgresRoleDelete(name string) Response {
+	defer s.LockUnlock()()
+
+	if _, exists := s.PostgresRoles[name]; !exists {
+		return postgresNotFoundResponse("role")
+	}
+
+	delete(s.PostgresRoles, name)
 
 	return Response{
 		Body: s.createOperationLocked(name, nil),
@@ -603,11 +1729,24 @@ func (s *FakeWorkspace) createOperationLocked(resourceName string, response any)
 	operationID := nextUUID()
 	operationName := resourceName + "/operations/" + operationID
 
-	// Determine resource type from name for metadata @type
+	// Determine resource type from name for metadata @type.
+	// Check the more specific suffixes first since database/role/endpoint names
+	// also contain "/branches/".
 	resourceType := "Project"
-	if strings.Contains(resourceName, "/endpoints/") {
+	switch {
+	case strings.HasPrefix(resourceName, "catalogs/"):
+		resourceType = "Catalog"
+	case strings.HasPrefix(resourceName, "synced_tables/"):
+		resourceType = "SyncedTable"
+	case strings.HasSuffix(resourceName, "/snapshot-schedule"):
+		resourceType = "SnapshotSchedule"
+	case strings.Contains(resourceName, "/endpoints/"):
 		resourceType = "Endpoint"
-	} else if strings.Contains(resourceName, "/branches/") {
+	case strings.Contains(resourceName, "/databases/"):
+		resourceType = "Database"
+	case strings.Contains(resourceName, "/roles/"):
+		resourceType = "Role"
+	case strings.Contains(resourceName, "/branches/"):
 		resourceType = "Branch"
 	}
 
@@ -628,6 +1767,85 @@ func (s *FakeWorkspace) createOperationLocked(resourceName string, response any)
 	return op
 }
 
+// PostgresSyncedTableCreate creates a new postgres synced table.
+func (s *FakeWorkspace) PostgresSyncedTableCreate(req Request, syncedTableID string) Response {
+	defer s.LockUnlock()()
+
+	if syncedTableID == "" {
+		return postgresErrorResponse(400, "INVALID_PARAMETER_VALUE", `Field 'synced_table_id' is required, expected non-default value (not "")!`)
+	}
+
+	var table postgres.SyncedTable
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &table); err != nil {
+			return Response{
+				StatusCode: 400,
+				Body:       fmt.Sprintf("cannot unmarshal request body: %v", err),
+			}
+		}
+	}
+
+	name := "synced_tables/" + syncedTableID
+
+	if _, exists := s.PostgresSyncedTables[name]; exists {
+		return postgresErrorResponse(409, "ALREADY_EXISTS", "synced table with such id already exists")
+	}
+	table.Name = name
+	table.Uid = nextUUID()
+	table.CreateTime = nowTime()
+
+	// GET on the real API returns only status; clear spec to match.
+	table.Spec = nil
+	table.Status = &postgres.SyncedTableSyncedTableStatus{
+		DetailedState:                 postgres.SyncedTableStateSyncedTableOnline,
+		UnityCatalogProvisioningState: postgres.ProvisioningInfoStateActive,
+	}
+
+	s.PostgresSyncedTables[name] = table
+
+	return Response{Body: s.createOperationLocked(name, table)}
+}
+
+// PostgresSyncedTableGet retrieves a postgres synced table by name.
+func (s *FakeWorkspace) PostgresSyncedTableGet(name string) Response {
+	defer s.LockUnlock()()
+
+	table, exists := s.PostgresSyncedTables[name]
+	if !exists {
+		return postgresNotFoundResponse("synced table")
+	}
+	return Response{Body: table}
+}
+
+// PostgresSyncedTableDelete deletes a postgres synced table. When the workspace
+// simulates eventual consistency, deletion is asynchronous and slow: the record is
+// not removed but left in DELETING, so GET keeps returning it and a create for the
+// same name keeps hitting 409 — the stuck-teardown race WaitAfterDelete waits out.
+// Otherwise (the default, and terraform, which recreates without polling) it is
+// removed immediately.
+func (s *FakeWorkspace) PostgresSyncedTableDelete(name string) Response {
+	defer s.LockUnlock()()
+
+	table, exists := s.PostgresSyncedTables[name]
+	if !exists {
+		return postgresNotFoundResponse("synced table")
+	}
+
+	if !s.eventualConsistency {
+		delete(s.PostgresSyncedTables, name)
+		return Response{Body: s.createOperationLocked(name, nil)}
+	}
+
+	if table.Status == nil {
+		table.Status = &postgres.SyncedTableSyncedTableStatus{}
+	}
+	table.Status.DetailedState = postgres.SyncedTableStateSyncedTableOffline
+	table.Status.UnityCatalogProvisioningState = postgres.ProvisioningInfoStateDeleting
+	s.PostgresSyncedTables[name] = table
+
+	return Response{Body: s.createOperationLocked(name, nil)}
+}
+
 // createDefaultBranchLocked creates a default branch for a project (caller must hold lock).
 // The default branch is named "production" to match cloud API behavior.
 func (s *FakeWorkspace) createDefaultBranchLocked(projectName string) {
@@ -637,11 +1855,13 @@ func (s *FakeWorkspace) createDefaultBranchLocked(projectName string) {
 
 	defaultBranch := postgres.Branch{
 		Name:       branchName,
+		BranchId:   "production",
 		Parent:     projectName,
 		Uid:        branchUID,
 		CreateTime: now,
 		UpdateTime: now,
 		Status: &postgres.BranchStatus{
+			BranchId:         "production",
 			CurrentState:     postgres.BranchStatusStateReady,
 			StateChangeTime:  now,
 			Default:          true,
@@ -652,4 +1872,62 @@ func (s *FakeWorkspace) createDefaultBranchLocked(projectName string) {
 	}
 
 	s.PostgresBranches[branchName] = defaultBranch
+	s.postgresImplicitBranches[branchName] = true
+
+	// Each branch implicitly provisions a primary read-write endpoint.
+	s.createDefaultEndpointLocked(branchName)
+}
+
+// createDefaultEndpointLocked creates the implicit primary read-write endpoint for
+// a branch (caller must hold lock). The endpoint is named "primary" to match cloud
+// API behavior.
+func (s *FakeWorkspace) createDefaultEndpointLocked(branchName string) {
+	now := nowTime()
+	endpointName := branchName + "/endpoints/primary"
+
+	// Inherit default endpoint settings from the project where available.
+	var (
+		minCu, maxCu   float64
+		suspendTimeout *duration.Duration
+		projectName    = strings.Split(branchName, "/branches/")[0]
+	)
+	if project, ok := s.PostgresProjects[projectName]; ok {
+		if project.Status != nil && project.Status.DefaultEndpointSettings != nil {
+			minCu = project.Status.DefaultEndpointSettings.AutoscalingLimitMinCu
+			maxCu = project.Status.DefaultEndpointSettings.AutoscalingLimitMaxCu
+			suspendTimeout = project.Status.DefaultEndpointSettings.SuspendTimeoutDuration
+		}
+	}
+
+	endpointUID := "ep-" + nextUUID()[:20]
+	host := endpointUID + ".database.us-east-1.cloud.databricks.com"
+
+	s.PostgresEndpoints[endpointName] = postgres.Endpoint{
+		Name:       endpointName,
+		EndpointId: "primary",
+		Parent:     branchName,
+		Uid:        endpointUID,
+		CreateTime: now,
+		UpdateTime: now,
+		Status: &postgres.EndpointStatus{
+			EndpointId:             "primary",
+			EndpointType:           postgres.EndpointTypeEndpointTypeReadWrite,
+			CurrentState:           postgres.EndpointStatusStateActive,
+			Disabled:               false,
+			Settings:               &postgres.EndpointSettings{},
+			AutoscalingLimitMinCu:  minCu,
+			AutoscalingLimitMaxCu:  maxCu,
+			SuspendTimeoutDuration: suspendTimeout,
+			// Primary read-write endpoint exposes only the read-write host;
+			// read_only_host is set on read-only endpoints created later.
+			Hosts: &postgres.EndpointHosts{Host: host},
+			Group: &postgres.EndpointGroupStatus{
+				Max:             1,
+				Min:             1,
+				ForceSendFields: []string{"EnableReadableSecondaries"},
+			},
+			ForceSendFields: []string{"Disabled"},
+		},
+	}
+	s.postgresImplicitEndpoints[endpointName] = true
 }

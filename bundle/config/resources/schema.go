@@ -3,11 +3,11 @@ package resources
 import (
 	"context"
 	"net/url"
-	"strings"
 
 	"github.com/databricks/databricks-sdk-go/apierr"
 
 	"github.com/databricks/cli/libs/log"
+	"github.com/databricks/cli/libs/workspaceurls"
 
 	"github.com/databricks/databricks-sdk-go"
 	"github.com/databricks/databricks-sdk-go/marshal"
@@ -16,6 +16,7 @@ import (
 
 type Schema struct {
 	BaseResource
+	ID string `json:"id,omitempty" bundle:"readonly"`
 	catalog.CreateSchema
 	// List of grants to apply on this schema.
 	Grants []catalog.PrivilegeAssignment `json:"grants,omitempty"`
@@ -50,12 +51,7 @@ func (s *Schema) InitializeURL(baseURL url.URL) {
 	if s.ID == "" {
 		return
 	}
-	baseURL.Path = "explore/data/" + strings.ReplaceAll(s.ID, ".", "/")
-	s.URL = baseURL.String()
-}
-
-func (s *Schema) GetURL() string {
-	return s.URL
+	s.URL = workspaceurls.ResourceURL(baseURL, "schemas", s.ID)
 }
 
 func (s *Schema) GetName() string {
