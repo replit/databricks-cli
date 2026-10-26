@@ -10,7 +10,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Maximum number of concurrent requests during sync. Chosen against the
+// Default maximum number of concurrent requests during sync (override with
+// SyncOptions.Concurrency). Chosen against the
 // per-endpoint rate limits documented at
 // https://docs.databricks.com/aws/en/resources/limits ("API rate limits" -
 // Workspace API), which sync stays within for the endpoints it calls.
@@ -21,7 +22,9 @@ func (s *Sync) applyDelete(ctx context.Context, remoteName string) error {
 	s.notifyProgress(ctx, EventActionDelete, remoteName, 0.0)
 
 	if !s.DryRun {
-		err := s.filer.Delete(ctx, remoteName)
+		err := retryOnTransient(ctx, s.RetryTimeout, "delete "+remoteName, func() error {
+			return s.filer.Delete(ctx, remoteName)
+		})
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -36,7 +39,9 @@ func (s *Sync) applyRmdir(ctx context.Context, remoteName string) error {
 	s.notifyProgress(ctx, EventActionDelete, remoteName, 0.0)
 
 	if !s.DryRun {
-		err := s.filer.Delete(ctx, remoteName)
+		err := retryOnTransient(ctx, s.RetryTimeout, "rmdir "+remoteName, func() error {
+			return s.filer.Delete(ctx, remoteName)
+		})
 		if err != nil {
 			// Directory deletion is opportunistic, so we ignore errors.
 			log.Debugf(ctx, "error removing directory %s: %s", remoteName, err)
@@ -52,7 +57,9 @@ func (s *Sync) applyMkdir(ctx context.Context, localName string) error {
 	s.notifyProgress(ctx, EventActionPut, localName, 0.0)
 
 	if !s.DryRun {
-		err := s.filer.Mkdir(ctx, localName)
+		err := retryOnTransient(ctx, s.RetryTimeout, "mkdir "+localName, func() error {
+			return s.filer.Mkdir(ctx, localName)
+		})
 		if err != nil {
 			return err
 		}
@@ -67,15 +74,16 @@ func (s *Sync) applyPut(ctx context.Context, localName string) error {
 	s.notifyProgress(ctx, EventActionPut, localName, 0.0)
 
 	if !s.DryRun {
-		localFile, err := s.LocalRoot.Open(localName)
-		if err != nil {
-			return err
-		}
-
-		defer localFile.Close()
-
 		opts := []filer.WriteMode{filer.CreateParentDirectories, filer.OverwriteIfExists}
-		err = s.filer.Write(ctx, localName, localFile, opts...)
+		err := retryOnTransient(ctx, s.RetryTimeout, "put "+localName, func() error {
+			// Re-open per attempt: filer.Write consumes the reader.
+			f, err := s.LocalRoot.Open(localName)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			return s.filer.Write(ctx, localName, f, opts...)
+		})
 		if err != nil {
 			return err
 		}
@@ -99,9 +107,9 @@ func groupRunSingle(ctx context.Context, group *errgroup.Group, fn func(context.
 	})
 }
 
-func groupRunParallel(ctx context.Context, paths []string, fn func(context.Context, string) error) error {
+func groupRunParallel(ctx context.Context, paths []string, limit int, fn func(context.Context, string) error) error {
 	group, ctx := errgroup.WithContext(ctx)
-	group.SetLimit(MaxRequestsInFlight)
+	group.SetLimit(limit)
 
 	for _, path := range paths {
 		groupRunSingle(ctx, group, fn, path)
@@ -112,17 +120,17 @@ func groupRunParallel(ctx context.Context, paths []string, fn func(context.Conte
 }
 
 func (s *Sync) applyDiff(ctx context.Context, d diff) error {
-	var err error
+	limit := s.Concurrency
 
 	// Delete files in parallel.
-	err = groupRunParallel(ctx, d.delete, s.applyDelete)
+	err := groupRunParallel(ctx, d.delete, limit, s.applyDelete)
 	if err != nil {
 		return err
 	}
 
 	// Delete directories ordered by depth from leaf to root.
 	for _, group := range d.groupedRmdir() {
-		err = groupRunParallel(ctx, group, s.applyRmdir)
+		err = groupRunParallel(ctx, group, limit, s.applyRmdir)
 		if err != nil {
 			return err
 		}
@@ -130,14 +138,12 @@ func (s *Sync) applyDiff(ctx context.Context, d diff) error {
 
 	// Create directories (leafs only because intermediates are created automatically).
 	for _, group := range d.groupedMkdir() {
-		err = groupRunParallel(ctx, group, s.applyMkdir)
+		err = groupRunParallel(ctx, group, limit, s.applyMkdir)
 		if err != nil {
 			return err
 		}
 	}
 
 	// Put files in parallel.
-	err = groupRunParallel(ctx, d.put, s.applyPut)
-
-	return err
+	return groupRunParallel(ctx, d.put, limit, s.applyPut)
 }
