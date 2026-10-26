@@ -3,12 +3,11 @@ package dresources
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/databricks/cli/bundle/config/resources"
-	"github.com/databricks/cli/bundle/deployplan"
 	"github.com/databricks/cli/libs/log"
-	"github.com/databricks/cli/libs/structs/structpath"
 	"github.com/databricks/cli/libs/utils"
 	"github.com/databricks/databricks-sdk-go"
 	"github.com/databricks/databricks-sdk-go/service/catalog"
@@ -50,6 +49,9 @@ func (r *ResourceVolume) DoCreate(ctx context.Context, config *catalog.CreateVol
 	return response.FullName, response, nil
 }
 
+// See schemaForceSend. Verified against a real workspace: {"comment": ""} clears it.
+var volumeForceSend = []string{"Comment"}
+
 func (r *ResourceVolume) DoUpdate(ctx context.Context, id string, config *catalog.CreateVolumeRequestContent, _ *PlanEntry) (*catalog.VolumeInfo, error) {
 	updateRequest := catalog.UpdateVolumeRequestContent{
 		Comment: config.Comment,
@@ -57,7 +59,7 @@ func (r *ResourceVolume) DoUpdate(ctx context.Context, id string, config *catalo
 		NewName: "", // Not supported by Update(). Needs DoUpdateWithID()
 		Owner:   "", // Not supported by DABs
 
-		ForceSendFields: utils.FilterFields[catalog.UpdateVolumeRequestContent](config.ForceSendFields, "NewName", "Owner"),
+		ForceSendFields: utils.FilterFields[catalog.UpdateVolumeRequestContent](append(slices.Clone(volumeForceSend), config.ForceSendFields...), "NewName", "Owner"),
 	}
 
 	nameFromID, err := getNameFromID(id)
@@ -81,7 +83,7 @@ func (r *ResourceVolume) DoUpdate(ctx context.Context, id string, config *catalo
 	return response, err
 }
 
-func (r *ResourceVolume) DoUpdateWithID(ctx context.Context, id string, config *catalog.CreateVolumeRequestContent) (string, *catalog.VolumeInfo, error) {
+func (r *ResourceVolume) DoUpdateWithID(ctx context.Context, id string, config *catalog.CreateVolumeRequestContent, _ *PlanEntry) (string, *catalog.VolumeInfo, error) {
 	updateRequest := catalog.UpdateVolumeRequestContent{
 		Comment: config.Comment,
 		Name:    id,
@@ -89,7 +91,7 @@ func (r *ResourceVolume) DoUpdateWithID(ctx context.Context, id string, config *
 		NewName: "", // Initialized below if needed
 		Owner:   "", // Not supported by DABs
 
-		ForceSendFields: utils.FilterFields[catalog.UpdateVolumeRequestContent](config.ForceSendFields, "Owner"),
+		ForceSendFields: utils.FilterFields[catalog.UpdateVolumeRequestContent](append(slices.Clone(volumeForceSend), config.ForceSendFields...), "Owner"),
 	}
 
 	items := strings.Split(id, ".")
@@ -110,37 +112,8 @@ func (r *ResourceVolume) DoUpdateWithID(ctx context.Context, id string, config *
 	return response.FullName, response, nil
 }
 
-func (r *ResourceVolume) DoDelete(ctx context.Context, id string) error {
+func (r *ResourceVolume) DoDelete(ctx context.Context, id string, _ *catalog.CreateVolumeRequestContent) error {
 	return r.client.Volumes.DeleteByName(ctx, id)
-}
-
-// OverrideChangeDesc suppresses drift for storage_location when the only difference
-// is a trailing slash. The UC API strips trailing slashes on create, so remote returns
-// "s3://bucket/path" while the config may have "s3://bucket/path/".
-//
-// This matches the Terraform provider's suppressLocationDiff behavior.
-// https://github.com/databricks/terraform-provider-databricks/blob/v1.65.1/catalog/resource_volume.go#L25
-func (*ResourceVolume) OverrideChangeDesc(_ context.Context, path *structpath.PathNode, change *ChangeDesc, _ *catalog.VolumeInfo) error {
-	if change.Action == deployplan.Skip {
-		return nil
-	}
-
-	if path.String() != "storage_location" {
-		return nil
-	}
-
-	newStr, newOk := change.New.(string)
-	remoteStr, remoteOk := change.Remote.(string)
-	if !newOk || !remoteOk {
-		return nil
-	}
-
-	if newStr != remoteStr && strings.TrimRight(newStr, "/") == strings.TrimRight(remoteStr, "/") {
-		change.Action = deployplan.Skip
-		change.Reason = deployplan.ReasonURLNormalization
-	}
-
-	return nil
 }
 
 func getNameFromID(id string) (string, error) {

@@ -39,6 +39,20 @@ func TestResolveNotFound(t *testing.T) {
 	require.ErrorContains(t, err, `reference does not exist: ${a}`)
 }
 
+func TestResolveNotFoundSuggestsCloseKey(t *testing.T) {
+	in := dyn.V(map[string]dyn.Value{
+		"host": dyn.V("example.com"),
+		"b":    dyn.V("${hst}"),
+	})
+
+	_, err := dynvar.Resolve(in, dynvar.DefaultLookup(in))
+	require.ErrorContains(t, err, "reference does not exist: ${hst}")
+
+	var refErr *dynvar.ReferenceError
+	require.ErrorAs(t, err, &refErr)
+	assert.Equal(t, []string{"host"}, refErr.Suggestions)
+}
+
 func TestResolveWithNesting(t *testing.T) {
 	in := dyn.V(map[string]dyn.Value{
 		"a": dyn.V("${f.a}"),
@@ -107,6 +121,27 @@ func TestResolveWithStringConcatenation(t *testing.T) {
 	assert.Equal(t, "aba", getByPath(t, out, "c").MustString())
 }
 
+func TestResolveWithEscapedReference(t *testing.T) {
+	in := dyn.V(map[string]dyn.Value{
+		"a":             dyn.V("A"),
+		"escaped_only":  dyn.V("$${a}"),
+		"escaped_first": dyn.V("$${a} ${a}"),
+		"real_first":    dyn.V("${a} $${a}"),
+		"surrounded":    dyn.V("$${a} ${a} $${a}"),
+		"other_name":    dyn.V("$${zz} ${a}"),
+	})
+
+	out, err := dynvar.Resolve(in, dynvar.DefaultLookup(in))
+	require.NoError(t, err)
+
+	// The escape is preserved here; it is removed when the API payload is built.
+	assert.Equal(t, "$${a}", getByPath(t, out, "escaped_only").MustString())
+	assert.Equal(t, "$${a} A", getByPath(t, out, "escaped_first").MustString())
+	assert.Equal(t, "A $${a}", getByPath(t, out, "real_first").MustString())
+	assert.Equal(t, "$${a} A $${a}", getByPath(t, out, "surrounded").MustString())
+	assert.Equal(t, "$${zz} A", getByPath(t, out, "other_name").MustString())
+}
+
 func TestResolveWithTypeInterpolation(t *testing.T) {
 	in := dyn.V(map[string]dyn.Value{
 		"a":          dyn.V(1),
@@ -129,14 +164,14 @@ func TestResolveWithTypeInterpolation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Integer interpolation
-	assert.EqualValues(t, "1 2", getByPath(t, out, "c").MustString())
+	assert.Equal(t, "1 2", getByPath(t, out, "c").MustString())
 
 	// Float interpolation
-	assert.EqualValues(t, "Value: 3.14", getByPath(t, out, "float_interp").MustString())
+	assert.Equal(t, "Value: 3.14", getByPath(t, out, "float_interp").MustString())
 
 	// Bool interpolation
-	assert.EqualValues(t, "Enabled: true", getByPath(t, out, "bool_true_interp").MustString())
-	assert.EqualValues(t, "Disabled: false", getByPath(t, out, "bool_false_interp").MustString())
+	assert.Equal(t, "Enabled: true", getByPath(t, out, "bool_true_interp").MustString())
+	assert.Equal(t, "Disabled: false", getByPath(t, out, "bool_false_interp").MustString())
 
 	// Time interpolation should convert to string representation of time.Time
 	// Note: time.Time string representation includes timezone info
@@ -145,7 +180,7 @@ func TestResolveWithTypeInterpolation(t *testing.T) {
 	assert.Contains(t, timeResult, "00:00:00")
 
 	// Nil interpolation
-	assert.EqualValues(t, "Null: <nil>", getByPath(t, out, "nil_interp").MustString())
+	assert.Equal(t, "Null: <nil>", getByPath(t, out, "nil_interp").MustString())
 }
 
 func TestResolveWithTypeRetentionFailure(t *testing.T) {
@@ -188,8 +223,8 @@ func TestResolveWithTypeRetention(t *testing.T) {
 	assert.Zero(t, 1.0-getByPath(t, out, "float").MustFloat())
 	assert.Zero(t, 1.0-getByPath(t, out, "float_var").MustFloat())
 
-	assert.EqualValues(t, "a", getByPath(t, out, "string").MustString())
-	assert.EqualValues(t, "a", getByPath(t, out, "string_var").MustString())
+	assert.Equal(t, "a", getByPath(t, out, "string").MustString())
+	assert.Equal(t, "a", getByPath(t, out, "string_var").MustString())
 }
 
 func TestResolveWithSkip(t *testing.T) {

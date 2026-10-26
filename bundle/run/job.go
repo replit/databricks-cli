@@ -14,6 +14,7 @@ import (
 	"github.com/databricks/cli/bundle/run/progress"
 	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/log"
+	"github.com/databricks/cli/libs/workspaceurls"
 	"github.com/databricks/databricks-sdk-go/service/jobs"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -96,8 +97,9 @@ func (m *jobRunMonitor) onProgress(info *jobs.Run) {
 
 	// First time we see this run.
 	if m.prevState == nil {
-		log.Infof(m.ctx, "Run available at %s", info.RunPageUrl)
-		cmdio.Log(m.ctx, progress.NewJobRunUrlEvent(info.RunPageUrl))
+		runURL := workspaceurls.ModernizeJobRunPageURL(info.RunPageUrl)
+		log.Infof(m.ctx, "Run available at %s", runURL)
+		cmdio.Log(m.ctx, progress.NewJobRunUrlEvent(runURL))
 	}
 
 	// No state change: do not log.
@@ -157,8 +159,11 @@ func (r *jobRunner) Run(ctx context.Context, opts *Options) (output.RunOutput, e
 		details, err := w.Jobs.GetRun(ctx, jobs.GetRunRequest{
 			RunId: waiter.RunId,
 		})
-		cmdio.Log(ctx, progress.NewJobRunUrlEvent(details.RunPageUrl))
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		cmdio.Log(ctx, progress.NewJobRunUrlEvent(workspaceurls.ModernizeJobRunPageURL(details.RunPageUrl)))
+		return nil, nil
 	}
 
 	run, err := waiter.OnProgress(monitor.onProgress).GetWithTimeout(jobRunTimeout)

@@ -38,6 +38,7 @@ func (p processStaticResources) Apply(ctx context.Context, b *bundle.Bundle) dia
 	// we need to resolve variables because they can change path values:
 	// - variable can be used a prefix
 	// - path can be part of a complex variable value
+
 	bundle.ApplySeqContext(
 		ctx,
 		b,
@@ -45,8 +46,6 @@ func (p processStaticResources) Apply(ctx context.Context, b *bundle.Bundle) dia
 		// Updates (dynamic): resources.* (strings) (resolves variable references to their actual values)
 		// Resolves variable references in 'resources' using bundle, workspace, and variables prefixes
 		mutator.ResolveVariableReferencesOnlyResources(),
-		// After normal variable resolution, log all ${resources.*} references
-		mutator.LogResourceReferences(),
 		mutator.NormalizePaths(),
 
 		// Translate dashboard paths into paths in the workspace file system
@@ -75,7 +74,7 @@ func getAllResources(b *bundle.Bundle) (ResourceKeySet, error) {
 		return root, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to collect resources: %s", err)
+		return nil, fmt.Errorf("failed to collect resources: %w", err)
 	}
 
 	return set, nil

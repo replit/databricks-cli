@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/databricks/cli/libs/auth/u2m"
 	"github.com/databricks/databricks-sdk-go/apierr"
 	"github.com/databricks/databricks-sdk-go/config"
-	"github.com/databricks/databricks-sdk-go/credentials/u2m"
 )
 
 // Auth type names returned by credential providers.
@@ -51,21 +51,33 @@ func AuthTypeDisplayName(authType string) string {
 	return authType
 }
 
+type rewrittenAuthError struct {
+	message string
+	cause   error
+}
+
+func (e *rewrittenAuthError) Error() string {
+	return e.message
+}
+
+func (e *rewrittenAuthError) Unwrap() error {
+	return e.cause
+}
+
 // RewriteAuthError rewrites the error message for invalid refresh token error.
 // It returns whether the error was rewritten and the rewritten error.
 func RewriteAuthError(ctx context.Context, host, accountId, profile string, err error) (bool, error) {
-	target := &u2m.InvalidRefreshTokenError{}
-	if errors.As(err, &target) {
-		oauthArgument, err := AuthArguments{
+	if _, ok := errors.AsType[*u2m.InvalidRefreshTokenError](err); ok {
+		oauthArgument, argErr := AuthArguments{
 			Host:      host,
 			AccountID: accountId,
 		}.ToOAuthArgument()
-		if err != nil {
-			return false, err
+		if argErr != nil {
+			return false, argErr
 		}
 		msg := `A new access token could not be retrieved because the refresh token is invalid. To reauthenticate, run the following command:
   $ ` + BuildLoginCommand(ctx, profile, oauthArgument)
-		return true, errors.New(msg)
+		return true, &rewrittenAuthError{message: msg, cause: err}
 	}
 	return false, err
 }
@@ -73,8 +85,8 @@ func RewriteAuthError(ctx context.Context, host, accountId, profile string, err 
 // EnrichAuthError appends identity context and remediation steps to 401/403 API errors.
 // For non-API errors or other status codes, the original error is returned unchanged.
 func EnrichAuthError(ctx context.Context, cfg *config.Config, err error) error {
-	var apiErr *apierr.APIError
-	if !errors.As(err, &apiErr) {
+	apiErr, ok := errors.AsType[*apierr.APIError](err)
+	if !ok {
 		return err
 	}
 	if apiErr.StatusCode != http.StatusUnauthorized && apiErr.StatusCode != http.StatusForbidden {
@@ -111,6 +123,27 @@ func EnrichAuthError(ctx context.Context, cfg *config.Config, err error) error {
 	}
 
 	return fmt.Errorf("%w\n%s", err, b.String())
+}
+
+// AppendAccountHostHint appends a note to errors from commands that ran with a
+// workspace client configured against a classic account console host. Such
+// hosts serve only account-level APIs, so a workspace command can never
+// succeed there and the note is relevant for any error. The console's
+// responses to workspace API paths are unstructured (HTML pages, bare-string
+// 400s), so there is no reliable way to detect "this API is not served here"
+// from the error itself; callers gate on the command type instead.
+func AppendAccountHostHint(cfg *config.Config, err error) error {
+	host := cfg.CanonicalHostName()
+	if !IsClassicAccountHost(host) {
+		return err
+	}
+	subject := "this configuration"
+	scope := ""
+	if cfg.Profile != "" {
+		subject = fmt.Sprintf("profile %q", cfg.Profile)
+		scope = " with this profile"
+	}
+	return fmt.Errorf("%w\n\nNote: %s points to a Databricks account console host (%s), which serves only account-level APIs.\nWorkspace commands need a workspace host: run `databricks auth login --host https://<workspace-url>`, or use `databricks account ...` commands%s", err, subject, host, scope)
 }
 
 // writeReauthSteps writes auth-type-aware re-authentication suggestions for 401 errors.

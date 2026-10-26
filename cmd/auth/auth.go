@@ -35,6 +35,7 @@ GCP: https://docs.gcp.databricks.com/dev-tools/auth/index.html`,
 	cmd.AddCommand(newLogoutCommand())
 	cmd.AddCommand(newProfilesCommand())
 	cmd.AddCommand(newTokenCommand(&authArguments))
+	cmd.AddCommand(newDockerCommand())
 	cmd.AddCommand(newDescribeCommand())
 	cmd.AddCommand(newSwitchCommand())
 	return cmd
@@ -45,8 +46,13 @@ func promptForHost(ctx context.Context) (string, error) {
 		return "", errors.New("the command is being run in a non-interactive environment, please specify a host using --host")
 	}
 
+	// The hint is printed separately so the prompt label stays short.
+	// promptui's screenbuf does not account for terminal line wrapping, and a
+	// long "label + value" line that wraps causes each keystroke to leave a
+	// stale render on screen instead of overwriting the previous one.
+	cmdio.LogString(ctx, "Example: https://<databricks-instance>.cloud.databricks.com")
 	return cmdio.RunPrompt(ctx, cmdio.PromptOptions{
-		Label: "Databricks host (e.g. https://<databricks-instance>.cloud.databricks.com)",
+		Label: "Databricks host",
 	})
 }
 

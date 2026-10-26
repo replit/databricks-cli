@@ -31,6 +31,18 @@ func TestNormalizeDotSeparatedID(t *testing.T) {
 	}
 }
 
+func TestJobRunPath(t *testing.T) {
+	assert.Equal(t, "jobs/123/runs/456", JobRunPath("123", "456"))
+}
+
+func TestJobRunURL(t *testing.T) {
+	base := url.URL{Scheme: "https", Host: "host.com"}
+	assert.Equal(t, "https://host.com/jobs/123/runs/456", JobRunURL(base, "123", "456"))
+
+	withWorkspace := url.URL{Scheme: "https", Host: "host.com", RawQuery: "w=789"}
+	assert.Equal(t, "https://host.com/jobs/123/runs/456?w=789", JobRunURL(withWorkspace, "123", "456"))
+}
+
 func TestResourceTypes(t *testing.T) {
 	types := ResourceTypes()
 	assert.NotEmpty(t, types)
@@ -45,15 +57,16 @@ func TestWorkspaceBaseURL(t *testing.T) {
 	tests := []struct {
 		name        string
 		host        string
-		workspaceID int64
+		workspaceID string
 		expected    string
 	}{
-		{"no workspace ID", "https://myworkspace.databricks.com", 0, "https://myworkspace.databricks.com"},
-		{"with workspace ID", "https://myworkspace.databricks.com", 123456, "https://myworkspace.databricks.com?o=123456"},
-		{"trailing slash stripped", "https://myworkspace.databricks.com/", 0, "https://myworkspace.databricks.com/"},
-		{"trailing slash with workspace ID", "https://myworkspace.databricks.com/", 789, "https://myworkspace.databricks.com/?o=789"},
-		{"adb hostname skips query param", "https://adb-123456.azuredatabricks.net", 123456, "https://adb-123456.azuredatabricks.net"},
-		{"adb hostname mismatch adds param", "https://adb-999.azuredatabricks.net", 123456, "https://adb-999.azuredatabricks.net?o=123456"},
+		{"no workspace ID", "https://myworkspace.databricks.com", "", "https://myworkspace.databricks.com"},
+		{"with workspace ID", "https://myworkspace.databricks.com", "123456", "https://myworkspace.databricks.com?w=123456"},
+		{"trailing slash stripped", "https://myworkspace.databricks.com/", "", "https://myworkspace.databricks.com/"},
+		{"trailing slash with workspace ID", "https://myworkspace.databricks.com/", "789", "https://myworkspace.databricks.com/?w=789"},
+		{"adb hostname skips query param", "https://adb-123456.azuredatabricks.net", "123456", "https://adb-123456.azuredatabricks.net"},
+		{"adb hostname mismatch adds param", "https://adb-999.azuredatabricks.net", "123456", "https://adb-999.azuredatabricks.net?w=123456"},
+		{"connection-id-style workspace ID passes through", "https://spog.example.com", "123e4567-e89b-12d3-a456-426614174000", "https://spog.example.com?w=123e4567-e89b-12d3-a456-426614174000"},
 	}
 
 	for _, tt := range tests {
@@ -66,7 +79,7 @@ func TestWorkspaceBaseURL(t *testing.T) {
 }
 
 func TestWorkspaceBaseURLInvalidHost(t *testing.T) {
-	_, err := workspaceBaseURL("://invalid", 0)
+	_, err := workspaceBaseURL("://invalid", "")
 	assert.ErrorContains(t, err, "invalid workspace host")
 }
 
@@ -76,14 +89,14 @@ func TestBuildResourceURL(t *testing.T) {
 		host         string
 		resourceType string
 		id           string
-		workspaceID  int64
+		workspaceID  string
 		expected     string
 	}{
-		{"simple path", "https://host.com", "jobs", "123", 0, "https://host.com/jobs/123"},
-		{"path with workspace ID", "https://host.com", "jobs", "123", 456, "https://host.com/jobs/123?o=456"},
-		{"fragment pattern", "https://host.com", "notebooks", "12345", 0, "https://host.com/#notebook/12345"},
-		{"fragment with workspace ID", "https://host.com", "notebooks", "12345", 789, "https://host.com/?o=789#notebook/12345"},
-		{"registered model normalizes dots", "https://host.com", "registered_models", "catalog.schema.model", 0, "https://host.com/explore/data/models/catalog/schema/model"},
+		{"simple path", "https://host.com", "jobs", "123", "", "https://host.com/jobs/123"},
+		{"path with workspace ID", "https://host.com", "jobs", "123", "456", "https://host.com/jobs/123?w=456"},
+		{"fragment pattern", "https://host.com", "notebooks", "12345", "", "https://host.com/#notebook/12345"},
+		{"fragment with workspace ID", "https://host.com", "notebooks", "12345", "789", "https://host.com/?w=789#notebook/12345"},
+		{"registered model normalizes dots", "https://host.com", "registered_models", "catalog.schema.model", "", "https://host.com/explore/data/models/catalog/schema/model"},
 	}
 
 	for _, tt := range tests {
@@ -96,7 +109,7 @@ func TestBuildResourceURL(t *testing.T) {
 }
 
 func TestBuildResourceURLUnknownType(t *testing.T) {
-	_, err := BuildResourceURL("https://host.com", "unknown", "123", 0)
+	_, err := BuildResourceURL("https://host.com", "unknown", "123", "")
 	assert.ErrorContains(t, err, "unknown resource type")
 }
 
@@ -110,6 +123,7 @@ func TestResourceURL(t *testing.T) {
 		{"jobs", "jobs", "123", "https://host.com/jobs/123"},
 		{"experiments", "experiments", "exp-1", "https://host.com/ml/experiments/exp-1"},
 		{"dashboards", "dashboards", "d-1", "https://host.com/dashboardsv3/d-1/published"},
+		{"genie_spaces", "genie_spaces", "space-1", "https://host.com/genie/rooms/space-1"},
 		{"notebooks", "notebooks", "12345", "https://host.com/#notebook/12345"},
 		{"notebooks with path", "notebooks", "/Users/u/nb", "https://host.com/#notebook//Users/u/nb"},
 		{"registered_models normalizes dots", "registered_models", "cat.sch.model", "https://host.com/explore/data/models/cat/sch/model"},
@@ -123,6 +137,55 @@ func TestResourceURL(t *testing.T) {
 			base := url.URL{Scheme: "https", Host: "host.com"}
 			got := ResourceURL(base, tt.resourceType, tt.id)
 			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestDeploymentURL(t *testing.T) {
+	tests := []struct {
+		name         string
+		deploymentID string
+		version      int
+		base         url.URL
+		expected     string
+	}{
+		{
+			name:         "id and version",
+			deploymentID: "996980114684409",
+			version:      2,
+			base:         url.URL{Scheme: "https", Host: "host.com"},
+			expected:     "https://host.com/deployments/996980114684409?version=2",
+		},
+		{
+			// The version is only known once CreateVersion has run, so link to the
+			// deployment itself rather than emitting version=0.
+			name:         "zero version omits the query",
+			deploymentID: "996980114684409",
+			version:      0,
+			base:         url.URL{Scheme: "https", Host: "host.com"},
+			expected:     "https://host.com/deployments/996980114684409",
+		},
+		{
+			// A base URL carrying ?w=<workspace id> keeps it, so a vanity or legacy
+			// host still addresses the right workspace.
+			name:         "preserves an existing query",
+			deploymentID: "42",
+			version:      7,
+			base:         url.URL{Scheme: "https", Host: "host.com", RawQuery: "w=123"},
+			expected:     "https://host.com/deployments/42?version=7&w=123",
+		},
+		{
+			name:         "empty id returns empty",
+			deploymentID: "",
+			version:      1,
+			base:         url.URL{Scheme: "https", Host: "host.com"},
+			expected:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, DeploymentURL(tt.base, tt.deploymentID, tt.version))
 		})
 	}
 }
@@ -149,6 +212,52 @@ func TestHasWorkspaceIDInHostname(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := hasWorkspaceIDInHostname(tt.hostname, tt.workspaceID)
 			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestModernizeJobRunPageURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		expected string
+	}{
+		{
+			"legacy fragment form preserves workspace selector",
+			"https://myworkspace.databricks.test/?o=900800700600#job/123/run/456",
+			"https://myworkspace.databricks.test/jobs/123/runs/456?o=900800700600",
+		},
+		{
+			"no workspace selector",
+			"https://myworkspace.databricks.test/#job/123/run/456",
+			"https://myworkspace.databricks.test/jobs/123/runs/456",
+		},
+		{
+			"http host with port",
+			"http://127.0.0.1:8080/?o=900800700600#job/1/run/2",
+			"http://127.0.0.1:8080/jobs/1/runs/2?o=900800700600",
+		},
+		// The conversion is cosmetic, so any other format passes through unchanged.
+		{
+			"already modern path is left as-is",
+			"https://myworkspace.databricks.test/jobs/123/runs/456?o=900800700600",
+			"https://myworkspace.databricks.test/jobs/123/runs/456?o=900800700600",
+		},
+		{
+			"incomplete fragment is left as-is",
+			"https://myworkspace.databricks.test/?o=900800700600#job/123",
+			"https://myworkspace.databricks.test/?o=900800700600#job/123",
+		},
+		{
+			"empty job id is left as-is",
+			"https://myworkspace.databricks.test/?o=900800700600#job//run/456",
+			"https://myworkspace.databricks.test/?o=900800700600#job//run/456",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, ModernizeJobRunPageURL(tt.raw))
 		})
 	}
 }

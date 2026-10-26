@@ -10,10 +10,11 @@ import (
 	"io/fs"
 	"slices"
 	"time"
+	"uuid"
 
 	"github.com/databricks/cli/libs/filer"
+	"github.com/databricks/cli/libs/retry"
 	"github.com/databricks/databricks-sdk-go"
-	"github.com/google/uuid"
 )
 
 type UnlockOption int
@@ -105,10 +106,16 @@ func (locker *Locker) assertLockHeld(ctx context.Context) error {
 		return err
 	}
 	if activeLockState.ID != locker.State.ID && !activeLockState.IsForced {
-		return fmt.Errorf("deploy lock acquired by %s at %v. Use --force-lock to override", activeLockState.User, activeLockState.AcquisitionTime)
+		return fmt.Errorf("deploy lock acquired by %s at %v.\n"+
+			"Another deployment may be in progress. Use --force-lock to override, but this may\n"+
+			"conflict with the other deployment if it is still active",
+			activeLockState.User, activeLockState.AcquisitionTime)
 	}
 	if activeLockState.ID != locker.State.ID && activeLockState.IsForced {
-		return fmt.Errorf("deploy lock force acquired by %s at %v. Use --force-lock to override", activeLockState.User, activeLockState.AcquisitionTime)
+		return fmt.Errorf("deploy lock force-acquired by %s at %v.\n"+
+			"Another deployment may be in progress. Use --force-lock to override, but this may\n"+
+			"conflict with the other deployment if it is still active",
+			activeLockState.User, activeLockState.AcquisitionTime)
 	}
 	return nil
 }
@@ -203,7 +210,7 @@ func CreateLocker(user, targetDir string, w *databricks.WorkspaceClient) (*Locke
 	}
 
 	locker := &Locker{
-		filer: filer,
+		filer: retry.Filer(filer),
 
 		TargetDir: targetDir,
 		Active:    false,

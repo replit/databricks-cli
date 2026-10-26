@@ -2,12 +2,14 @@ package direct
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/databricks/cli/bundle/config"
 	"github.com/databricks/cli/bundle/deployplan"
+	"github.com/databricks/cli/bundle/direct/dresources"
 	"github.com/databricks/cli/bundle/direct/dstate"
 	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/cli/libs/structs/structaccess"
@@ -61,14 +63,25 @@ type BindResult struct {
 // Call Finalize to commit the state or Cancel to discard.
 func (b *DeploymentBundle) Bind(ctx context.Context, client *databricks.WorkspaceClient, configRoot *config.Root, statePath, resourceKey, resourceID string) (*BindResult, error) {
 	// Check if the resource is already managed (bound to a different ID)
+	// The state is opened without a DMS client, so the writes below record nothing;
+	// phases.Bind and phases.Unbind refuse to run at all when recording is enabled.
 	var checkStateDB dstate.DeploymentState
-	if err := checkStateDB.Open(statePath); err == nil {
-		if existingID := checkStateDB.GetResourceID(resourceKey); existingID != "" {
-			return nil, ErrResourceAlreadyBound{
-				ResourceKey: resourceKey,
-				ExistingID:  existingID,
-				NewID:       resourceID,
-			}
+	if err := checkStateDB.Open(ctx, statePath, dstate.WithRecovery(true), dstate.WithWrite(false), dstate.WithDeploymentHistory(false), dstate.OpenDmsArgs{}); err != nil {
+		// State that cannot be read is not the same as state without a binding:
+		// the resource may well be managed already, and binding on top of it
+		// would take over a resource whose ownership was never checked. A state
+		// file that does not exist yet opens successfully as an empty one.
+		return nil, fmt.Errorf("cannot check whether %s is already bound: %w", resourceKey, err)
+	}
+	existingID := checkStateDB.GetResourceID(resourceKey)
+	if _, err := checkStateDB.Finalize(ctx); err != nil {
+		log.Warnf(ctx, "failed to finalize state: %v", err)
+	}
+	if existingID != "" {
+		return nil, ErrResourceAlreadyBound{
+			ResourceKey: resourceKey,
+			ExistingID:  existingID,
+			NewID:       resourceID,
 		}
 	}
 
@@ -82,21 +95,21 @@ func (b *DeploymentBundle) Bind(ctx context.Context, client *databricks.Workspac
 	}
 
 	// Open temp state
-	err := b.StateDB.Open(tmpStatePath)
+	err := b.StateDB.Open(ctx, tmpStatePath, dstate.WithRecovery(false), dstate.WithWrite(true), dstate.WithDeploymentHistory(false), dstate.OpenDmsArgs{})
 	if err != nil {
 		os.Remove(tmpStatePath)
 		return nil, err
 	}
 
 	// Save state with ID and empty state (like migrate does)
-	err = b.StateDB.SaveState(resourceKey, resourceID, struct{}{}, nil)
+	err = b.StateDB.SaveState(ctx, resourceKey, resourceID, struct{}{}, nil)
 	if err != nil {
 		os.Remove(tmpStatePath)
 		return nil, err
 	}
 
 	// Finalize to persist temp state to disk
-	err = b.StateDB.Finalize()
+	_, err = b.StateDB.Finalize(ctx)
 	if err != nil {
 		os.Remove(tmpStatePath)
 		return nil, err
@@ -105,10 +118,18 @@ func (b *DeploymentBundle) Bind(ctx context.Context, client *databricks.Workspac
 	log.Infof(ctx, "Bound %s to id=%s (in temp state)", resourceKey, resourceID)
 
 	// First plan + update: populate state with resolved config
+	err = b.StateDB.Open(ctx, tmpStatePath, dstate.WithRecovery(true), dstate.WithWrite(false), dstate.WithDeploymentHistory(false), dstate.OpenDmsArgs{})
+	if err != nil {
+		os.Remove(tmpStatePath)
+		return nil, err
+	}
 	plan, err := b.CalculatePlan(ctx, client, configRoot)
 	if err != nil {
 		os.Remove(tmpStatePath)
 		return nil, err
+	}
+	if _, err := b.StateDB.Finalize(ctx); err != nil {
+		log.Warnf(ctx, "failed to finalize state: %v", err)
 	}
 
 	// Populate the state with the resolved config
@@ -120,10 +141,11 @@ func (b *DeploymentBundle) Bind(ctx context.Context, client *databricks.Workspac
 			dependsOn = entry.DependsOn
 		}
 
-		// Copy etag from remote state for dashboards.
-		// Dashboards store "etag" in state which is not provided by user but comes from remote.
-		// If we don't store "etag" in state, we won't detect remote drift correctly.
-		if strings.Contains(resourceKey, ".dashboards.") && entry != nil && entry.RemoteState != nil {
+		// Copy etag from remote state for resources that use etag-based drift
+		// detection (dashboards and genie spaces). The etag is not provided by the
+		// user; it comes from remote. If we don't store it in state, we won't
+		// detect remote drift correctly and the next plan shows a bogus update.
+		if (strings.Contains(resourceKey, ".dashboards.") || strings.Contains(resourceKey, ".genie_spaces.")) && entry != nil && entry.RemoteState != nil {
 			etag, err := structaccess.Get(entry.RemoteState, structpath.NewStringKey(nil, "etag"))
 			if err == nil && etag != nil {
 				if etagStr, ok := etag.(string); ok && etagStr != "" {
@@ -132,13 +154,32 @@ func (b *DeploymentBundle) Bind(ctx context.Context, client *databricks.Workspac
 			}
 		}
 
-		err = b.StateDB.SaveState(resourceKey, resourceID, sv.Value, dependsOn)
+		// Compact hashed_fields fields so the persisted state stays small. Not needed for
+		// correctness — the next plan (CalculatePlan) compacts the saved state on read.
+		adapter, err := b.getAdapterForKey(resourceKey)
+		if err != nil {
+			os.Remove(tmpStatePath)
+			return nil, err
+		}
+		compacted, err := dresources.CompactState(adapter.ResourceConfig(), sv.Value)
+		if err != nil {
+			os.Remove(tmpStatePath)
+			return nil, fmt.Errorf("compacting state: %w", err)
+		}
+
+		err = b.StateDB.Open(ctx, tmpStatePath, dstate.WithRecovery(true), dstate.WithWrite(true), dstate.WithDeploymentHistory(false), dstate.OpenDmsArgs{})
 		if err != nil {
 			os.Remove(tmpStatePath)
 			return nil, err
 		}
 
-		err = b.StateDB.Finalize()
+		err = b.StateDB.SaveState(ctx, resourceKey, resourceID, compacted, dependsOn)
+		if err != nil {
+			os.Remove(tmpStatePath)
+			return nil, err
+		}
+
+		_, err = b.StateDB.Finalize(ctx)
 		if err != nil {
 			os.Remove(tmpStatePath)
 			return nil, err
@@ -146,7 +187,15 @@ func (b *DeploymentBundle) Bind(ctx context.Context, client *databricks.Workspac
 	}
 
 	// Second plan: this is the plan to present to the user (change between remote resource and config)
+	err = b.StateDB.Open(ctx, tmpStatePath, dstate.WithRecovery(true), dstate.WithWrite(false), dstate.WithDeploymentHistory(false), dstate.OpenDmsArgs{})
+	if err != nil {
+		os.Remove(tmpStatePath)
+		return nil, err
+	}
 	plan, err = b.CalculatePlan(ctx, client, configRoot)
+	if _, ferr := b.StateDB.Finalize(ctx); ferr != nil {
+		log.Warnf(ctx, "failed to finalize state: %v", ferr)
+	}
 	if err != nil {
 		os.Remove(tmpStatePath)
 		return nil, err
@@ -188,13 +237,16 @@ func (result *BindResult) Cancel() {
 // Unbind removes a resource from direct engine state without deleting
 // the workspace resource. Also removes associated permissions/grants entries.
 func (b *DeploymentBundle) Unbind(ctx context.Context, statePath, resourceKey string) error {
-	err := b.StateDB.Open(statePath)
+	err := b.StateDB.Open(ctx, statePath, dstate.WithRecovery(true), dstate.WithWrite(true), dstate.WithDeploymentHistory(false), dstate.OpenDmsArgs{})
 	if err != nil {
+		if errors.Is(err, dstate.ErrUnsettingRecording) {
+			return errors.New("unbind is not supported for a bundle target that records deployment history")
+		}
 		return err
 	}
 
 	// Delete the main resource
-	err = b.StateDB.DeleteState(resourceKey)
+	err = b.StateDB.DeleteState(ctx, resourceKey, false)
 	if err != nil {
 		return err
 	}
@@ -208,7 +260,7 @@ func (b *DeploymentBundle) Unbind(ctx context.Context, statePath, resourceKey st
 
 	for key := range b.StateDB.Data.State {
 		if key == permissionsKey || key == grantsKey || strings.HasPrefix(key, resourceKey+".") {
-			err = b.StateDB.DeleteState(key)
+			err = b.StateDB.DeleteState(ctx, key, false)
 			if err != nil {
 				return err
 			}
@@ -216,5 +268,6 @@ func (b *DeploymentBundle) Unbind(ctx context.Context, statePath, resourceKey st
 		}
 	}
 
-	return b.StateDB.Finalize()
+	_, err = b.StateDB.Finalize(ctx)
+	return err
 }

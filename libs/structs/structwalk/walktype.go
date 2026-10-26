@@ -104,24 +104,23 @@ func walkTypeValue(path *structpath.PatternNode, typ reflect.Type, field *reflec
 }
 
 func walkTypeStruct(path *structpath.PatternNode, st reflect.Type, visit VisitTypeFunc, visitedCount map[reflect.Type]int) {
-	for i := range st.NumField() {
-		sf := st.Field(i)
+	for sf := range st.Fields() {
 		if sf.PkgPath != "" {
 			continue // unexported
 		}
 
-		// Handle embedded structs (anonymous fields without json tags)
+		// Handle embedded structs that encoding/json flattens. The json *name* decides, not
+		// the presence of a tag: `json:",omitempty"` on an embed leaves the name empty and is
+		// still flattened, while a name makes it a nested object.
 		jsonTag := sf.Tag.Get("json")
-		if sf.Anonymous && jsonTag == "" {
-			// For embedded structs, walk the embedded type at the current path level
-			// This flattens the embedded struct's fields into the parent struct
+		if structaccess.IsFlattenedEmbed(sf) {
 			walkTypeValue(path, sf.Type, &sf, visit, visitedCount)
 			continue
 		}
 
 		// Skip fields marked as "-" in json tag
 		jsonTagName := structtag.JSONTag(jsonTag).Name()
-		if jsonTagName == "-" {
+		if structaccess.IsSkippedField(sf) {
 			continue
 		}
 

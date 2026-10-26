@@ -2,13 +2,12 @@ envsubst < databricks.yml.tmpl > databricks.yml
 
 cleanup() {
     trace $CLI bundle destroy --auto-approve
-    rm -f out.requests.txt
+    rm -f "$OUT_REQUESTS"
 }
 trap cleanup EXIT
 
 print_app_requests() {
-    jq --sort-keys 'select(.method != "GET" and (.path | contains("/apps")))' < out.requests.txt
-    rm out.requests.txt
+    print_requests.py //apps
 }
 
 title "(started omitted) -> deploy: app created with no_compute=true, no start/stop requests"
@@ -80,6 +79,6 @@ trace $CLI bundle deploy
 trace print_app_requests
 
 title "(started omitted, app running) -> bundle plan shows no drift"
-$CLI bundle plan -o json > LOG.planjson
+$CLI bundle plan -o json | nostamp > LOG.planjson
 verify_no_drift.py LOG.planjson
 echo "Plan: no drift detected"

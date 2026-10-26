@@ -1,11 +1,9 @@
 package ssh
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/databricks/cli/cmd/root"
-	"github.com/databricks/cli/experimental/ssh/internal/client"
 	"github.com/databricks/cli/experimental/ssh/internal/setup"
 	"github.com/databricks/cli/libs/cmdctx"
 	"github.com/spf13/cobra"
@@ -14,21 +12,23 @@ import (
 func newSetupCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Setup SSH configuration for Databricks compute",
-		Long: `Setup SSH configuration for Databricks compute.
+		Short: "Setup SSH configuration for dedicated (single-user) clusters",
+		Long: `Setup SSH configuration for dedicated (single-user) clusters.
 
-This command configures SSH to connect to Databricks compute by adding
-an SSH host configuration to your SSH config file.
+After running setup, you can connect with ` + "`ssh <name>`" + `.
 
-` + disclaimer,
+For serverless connections, use ` + "`databricks ssh connect`" + ` (no setup step needed).`,
 	}
 
 	var hostName string
 	var clusterID string
 	var sshConfigPath string
 	var shutdownDelay time.Duration
+	var maxClients int
+	var serverTimeout time.Duration
 	var autoStartCluster bool
 	var autoApprove bool
+	var keepDetachedProcesses bool
 
 	cmd.Flags().StringVar(&hostName, "name", "", "Host name to use in SSH config")
 	cmd.MarkFlagRequired("name")
@@ -36,6 +36,9 @@ an SSH host configuration to your SSH config file.
 	cmd.Flags().BoolVar(&autoStartCluster, "auto-start-cluster", true, "Automatically start the cluster when establishing the ssh connection")
 	cmd.Flags().StringVar(&sshConfigPath, "ssh-config", "", "Path to SSH config file (default ~/.ssh/config)")
 	cmd.Flags().DurationVar(&shutdownDelay, "shutdown-delay", defaultShutdownDelay, "SSH server will terminate after this delay if there are no active connections")
+	cmd.Flags().IntVar(&maxClients, "max-clients", defaultMaxClients, "Maximum number of SSH clients")
+	cmd.Flags().DurationVar(&serverTimeout, "server-timeout", defaultServerTimeout, "Maximum lifetime of the SSH server; it is terminated after this duration even if clients are connected")
+	cmd.Flags().BoolVar(&keepDetachedProcesses, "keep-detached-processes", false, "Keep the SSH server and detached processes (tmux, setsid, nohup) running while detached work remains, bounded by --server-timeout")
 	cmd.Flags().BoolVar(&autoApprove, "auto-approve", false, "Skip confirmation prompts, recreating existing SSH host configs without asking")
 
 	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
@@ -49,25 +52,17 @@ an SSH host configuration to your SSH config file.
 		ctx := cmd.Context()
 		wsClient := cmdctx.WorkspaceClient(ctx)
 		setupOpts := setup.SetupOptions{
-			HostName:         hostName,
-			ClusterID:        clusterID,
-			AutoStartCluster: autoStartCluster,
-			SSHConfigPath:    sshConfigPath,
-			ShutdownDelay:    shutdownDelay,
-			Profile:          wsClient.Config.Profile,
-			AutoApprove:      autoApprove,
+			HostName:              hostName,
+			ClusterID:             clusterID,
+			AutoStartCluster:      autoStartCluster,
+			SSHConfigPath:         sshConfigPath,
+			ShutdownDelay:         shutdownDelay,
+			MaxClients:            maxClients,
+			ServerTimeout:         resolveServerTimeout(cmd.Flags(), serverTimeout, shutdownDelay),
+			KeepDetachedProcesses: keepDetachedProcesses,
+			Profile:               wsClient.Config.Profile,
+			AutoApprove:           autoApprove,
 		}
-		clientOpts := client.ClientOptions{
-			ClusterID:        setupOpts.ClusterID,
-			AutoStartCluster: setupOpts.AutoStartCluster,
-			ShutdownDelay:    setupOpts.ShutdownDelay,
-			Profile:          setupOpts.Profile,
-		}
-		proxyCommand, err := clientOpts.ToProxyCommand()
-		if err != nil {
-			return fmt.Errorf("failed to generate ProxyCommand: %w", err)
-		}
-		setupOpts.ProxyCommand = proxyCommand
 		return setup.Setup(ctx, wsClient, setupOpts)
 	}
 

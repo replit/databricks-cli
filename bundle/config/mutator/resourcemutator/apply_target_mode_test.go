@@ -92,8 +92,11 @@ func mockBundle(mode config.Mode) *bundle.Bundle {
 						},
 					},
 				},
+				JobRuns: map[string]*resources.JobRun{
+					"job_run1": {RunNow: jobs.RunNow{JobId: 1234}},
+				},
 				Pipelines: map[string]*resources.Pipeline{
-					"pipeline1": {CreatePipeline: pipelines.CreatePipeline{Name: "pipeline1", Continuous: true}},
+					"pipeline1": {CreatePipeline: pipelines.CreatePipeline{Name: "pipeline1", Continuous: true}}, //nolint:staticcheck // SA1019: pipeline continuous is deprecated in the SDK but remains a supported bundle config field
 				},
 				Experiments: map[string]*resources.MlflowExperiment{
 					"experiment1": {CreateExperiment: ml.CreateExperiment{Name: "/Users/lennart.kats@databricks.com/experiment1"}},
@@ -104,6 +107,15 @@ func mockBundle(mode config.Mode) *bundle.Bundle {
 				},
 				ModelServingEndpoints: map[string]*resources.ModelServingEndpoint{
 					"servingendpoint1": {CreateServingEndpoint: serving.CreateServingEndpoint{Name: "servingendpoint1"}},
+				},
+				ModelServices: map[string]*resources.ModelService{
+					"modelservice1": {ModelServiceConfig: resources.ModelServiceConfig{Parent: "schemas/main.default", ModelServiceId: "modelservice1"}},
+				},
+				McpServices: map[string]*resources.McpService{
+					"mcpservice1": {McpServiceConfig: resources.McpServiceConfig{Parent: "schemas/main.default", McpServiceId: "mcpservice1"}},
+				},
+				ModelProviderServices: map[string]*resources.ModelProviderService{
+					"modelproviderservice1": {ModelProviderServiceConfig: resources.ModelProviderServiceConfig{Parent: "schemas/main.default", ModelProviderServiceId: "modelproviderservice1"}},
 				},
 				RegisteredModels: map[string]*resources.RegisteredModel{
 					"registeredmodel1": {CreateRegisteredModelRequest: catalog.CreateRegisteredModelRequest{Name: "registeredmodel1"}},
@@ -144,13 +156,29 @@ func mockBundle(mode config.Mode) *bundle.Bundle {
 				Volumes: map[string]*resources.Volume{
 					"volume1": {CreateVolumeRequestContent: catalog.CreateVolumeRequestContent{Name: "volume1"}},
 				},
+				Features: map[string]*resources.Feature{
+					"feature1": {Feature: ml.Feature{FullName: "catalog1.schema1.feature1"}},
+				},
 				Clusters: map[string]*resources.Cluster{
 					"cluster1": {ClusterSpec: compute.ClusterSpec{ClusterName: "cluster1", SparkVersion: "13.2.x", NumWorkers: 1}},
+				},
+				InstancePools: map[string]*resources.InstancePool{
+					"instance_pool1": {CreateInstancePool: compute.CreateInstancePool{InstancePoolName: "instance_pool1", NodeTypeId: "i3.xlarge"}},
+				},
+				ClusterPolicies: map[string]*resources.ClusterPolicy{
+					"cluster_policy1": {CreatePolicy: compute.CreatePolicy{Name: "cluster_policy1"}},
 				},
 				Dashboards: map[string]*resources.Dashboard{
 					"dashboard1": {
 						DashboardConfig: resources.DashboardConfig{
 							DisplayName: "dashboard1",
+						},
+					},
+				},
+				GenieSpaces: map[string]*resources.GenieSpace{
+					"geniespace1": {
+						GenieSpaceConfig: resources.GenieSpaceConfig{
+							Title: "geniespace1",
 						},
 					},
 				},
@@ -164,6 +192,15 @@ func mockBundle(mode config.Mode) *bundle.Bundle {
 				SecretScopes: map[string]*resources.SecretScope{
 					"secretScope1": {
 						Name: "secretScope1",
+					},
+				},
+				Secrets: map[string]*resources.Secret{
+					"secret1": {
+						Secret: catalog.Secret{
+							CatalogName: "main",
+							SchemaName:  "default",
+							Name:        "secret1",
+						},
 					},
 				},
 				SqlWarehouses: map[string]*resources.SqlWarehouse{
@@ -247,12 +284,68 @@ func mockBundle(mode config.Mode) *bundle.Bundle {
 						},
 					},
 				},
+				PostgresCatalogs: map[string]*resources.PostgresCatalog{
+					"postgres_catalog1": {
+						PostgresCatalogConfig: resources.PostgresCatalogConfig{
+							CatalogId: "postgres_catalog_1",
+						},
+					},
+				},
+				PostgresDatabases: map[string]*resources.PostgresDatabase{
+					"postgres_database1": {
+						PostgresDatabaseConfig: resources.PostgresDatabaseConfig{
+							DatabaseId: "postgres-database-1",
+							Parent:     "projects/postgres-project-1/branches/postgres-branch-1",
+						},
+					},
+				},
+				PostgresRoles: map[string]*resources.PostgresRole{
+					"postgres_role1": {
+						PostgresRoleConfig: resources.PostgresRoleConfig{
+							RoleId: "postgres-role-1",
+							Parent: "projects/postgres-project-1/branches/postgres-branch-1",
+							RoleRoleSpec: postgres.RoleRoleSpec{
+								PostgresRole: "postgres_role_1",
+							},
+						},
+					},
+				},
+				PostgresSyncedTables: map[string]*resources.PostgresSyncedTable{
+					"postgres_synced_table1": {
+						PostgresSyncedTableConfig: resources.PostgresSyncedTableConfig{
+							SyncedTableId: "catalog.schema.table1",
+						},
+					},
+				},
+				PostgresSnapshotSchedules: map[string]*resources.PostgresSnapshotSchedule{
+					"postgres_snapshot_schedule1": {
+						PostgresSnapshotScheduleConfig: resources.PostgresSnapshotScheduleConfig{
+							Branch: "projects/project1/branches/branch1",
+						},
+					},
+				},
 				VectorSearchEndpoints: map[string]*resources.VectorSearchEndpoint{
 					"vs_endpoint1": {
 						CreateEndpoint: vectorsearch.CreateEndpoint{
 							Name:         "vs_endpoint1",
 							EndpointType: vectorsearch.EndpointTypeStandard,
 						},
+					},
+				},
+				VectorSearchIndexes: map[string]*resources.VectorSearchIndex{
+					"vs_index1": {
+						CreateVectorIndexRequest: vectorsearch.CreateVectorIndexRequest{
+							Name:         "main.default.vs_index1",
+							EndpointName: "vs_endpoint1",
+							PrimaryKey:   "id",
+							IndexType:    vectorsearch.VectorIndexTypeDeltaSync,
+						},
+					},
+				},
+				Snapshots: map[string]*resources.Snapshot{
+					"snapshot1": {
+						BundleID: "bundle1",
+						ACL:      nil,
 					},
 				},
 			},
@@ -284,8 +377,8 @@ func TestProcessTargetModeDevelopment(t *testing.T) {
 
 	// Pipeline 1
 	assert.Equal(t, "[dev lennart] pipeline1", b.Config.Resources.Pipelines["pipeline1"].Name)
-	assert.False(t, b.Config.Resources.Pipelines["pipeline1"].Continuous)
-	assert.True(t, b.Config.Resources.Pipelines["pipeline1"].Development)
+	assert.False(t, b.Config.Resources.Pipelines["pipeline1"].Continuous) //nolint:staticcheck // SA1019: pipeline continuous is deprecated in the SDK but remains a supported bundle config field
+	assert.True(t, b.Config.Resources.Pipelines["pipeline1"].Development) //nolint:staticcheck // SA1019: pipeline development is deprecated in the SDK but remains a supported bundle config field
 
 	// Experiment 1
 	assert.Equal(t, "/Users/lennart.kats@databricks.com/[dev lennart] experiment1", b.Config.Resources.Experiments["experiment1"].Name)
@@ -303,8 +396,11 @@ func TestProcessTargetModeDevelopment(t *testing.T) {
 	// Model serving endpoint 1
 	assert.Equal(t, "dev_lennart_servingendpoint1", b.Config.Resources.ModelServingEndpoints["servingendpoint1"].Name)
 
-	// Vector search endpoint 1
-	assert.Equal(t, "dev_lennart_vs_endpoint1", b.Config.Resources.VectorSearchEndpoints["vs_endpoint1"].Name)
+	// Vector search endpoint 1: name is the primary key, so it must not be prefixed.
+	assert.Equal(t, "vs_endpoint1", b.Config.Resources.VectorSearchEndpoints["vs_endpoint1"].Name)
+
+	// Vector search index 1: name is the primary key, so it must not be prefixed.
+	assert.Equal(t, "main.default.vs_index1", b.Config.Resources.VectorSearchIndexes["vs_index1"].Name)
 
 	// Registered model 1
 	assert.Equal(t, "dev_lennart_registeredmodel1", b.Config.Resources.RegisteredModels["registeredmodel1"].Name)
@@ -320,8 +416,14 @@ func TestProcessTargetModeDevelopment(t *testing.T) {
 	// Clusters
 	assert.Equal(t, "[dev lennart] cluster1", b.Config.Resources.Clusters["cluster1"].ClusterName)
 
+	// Instance pools
+	assert.Equal(t, "[dev lennart] instance_pool1", b.Config.Resources.InstancePools["instance_pool1"].InstancePoolName)
+
 	// Dashboards
 	assert.Equal(t, "[dev lennart] dashboard1", b.Config.Resources.Dashboards["dashboard1"].DisplayName)
+
+	// Genie Spaces
+	assert.Equal(t, "[dev lennart] geniespace1", b.Config.Resources.GenieSpaces["geniespace1"].Title)
 
 	// Alert 1: has schedule without pause status set - should be paused
 	assert.Equal(t, "[dev lennart] alert1", b.Config.Resources.Alerts["alert1"].DisplayName)
@@ -385,14 +487,16 @@ func TestProcessTargetModeDefault(t *testing.T) {
 	require.NoError(t, diags.Error())
 	assert.Equal(t, "job1", b.Config.Resources.Jobs["job1"].Name)
 	assert.Equal(t, "pipeline1", b.Config.Resources.Pipelines["pipeline1"].Name)
-	assert.False(t, b.Config.Resources.Pipelines["pipeline1"].Development)
+	assert.False(t, b.Config.Resources.Pipelines["pipeline1"].Development) //nolint:staticcheck // SA1019: pipeline development is deprecated in the SDK but remains a supported bundle config field
 	assert.Equal(t, "servingendpoint1", b.Config.Resources.ModelServingEndpoints["servingendpoint1"].Name)
 	assert.Equal(t, "registeredmodel1", b.Config.Resources.RegisteredModels["registeredmodel1"].Name)
 	assert.Equal(t, "qualityMonitor1", b.Config.Resources.QualityMonitors["qualityMonitor1"].TableName)
 	assert.Equal(t, "catalog1", b.Config.Resources.Catalogs["catalog1"].Name)
 	assert.Equal(t, "schema1", b.Config.Resources.Schemas["schema1"].Name)
 	assert.Equal(t, "volume1", b.Config.Resources.Volumes["volume1"].Name)
+	assert.Equal(t, "catalog1.schema1.feature1", b.Config.Resources.Features["feature1"].FullName)
 	assert.Equal(t, "cluster1", b.Config.Resources.Clusters["cluster1"].ClusterName)
+	assert.Equal(t, "instance_pool1", b.Config.Resources.InstancePools["instance_pool1"].InstancePoolName)
 	assert.Equal(t, "sql_warehouse1", b.Config.Resources.SqlWarehouses["sql_warehouse1"].Name)
 }
 
@@ -414,17 +518,39 @@ func TestAllResourcesMocked(t *testing.T) {
 	}
 }
 
-// Make sure that we at rename all non UC resources
-func TestAllNonUcResourcesAreRenamed(t *testing.T) {
+// TestAppropriateResourcesAreRenamed checks that every resource with a user-facing
+// Name field is renamed by dev-mode / presets.name_prefix, except for an
+// explicit carve-out list. The carve-out applies to resources whose Name is
+// the API primary key / object id (not a display name) — prefixing those
+// would change the resource's identity rather than its label.
+func TestAppropriateResourcesAreRenamed(t *testing.T) {
 	b := mockBundle(config.Development)
 
-	// UC resources should not have a prefix added to their name. Right now
-	// this list only contains the Volume, Catalog, and ExternalLocation resources since we have yet to remove
-	// prefixing support for UC schemas and registered models.
-	ucFields := []reflect.Type{
+	notRenamedFields := []reflect.Type{
 		reflect.TypeFor[*resources.Catalog](),
 		reflect.TypeFor[*resources.ExternalLocation](),
 		reflect.TypeFor[*resources.Volume](),
+		reflect.TypeFor[*resources.VectorSearchEndpoint](),
+		reflect.TypeFor[*resources.VectorSearchIndex](),
+	}
+
+	// Resources whose Name is server-generated or otherwise not a user-facing
+	// label, so the rename matrix doesn't apply. Reflection still finds a
+	// Name field on these via embedded SDK types, hence the explicit skip.
+	notUserNamed := []string{
+		"Apps",
+		"Features",
+		"SecretScopes",
+		"Secrets",
+		"DatabaseInstances",
+		"DatabaseCatalogs",
+		"SyncedDatabaseTables",
+		"PostgresProjects",
+		"PostgresBranches",
+		"PostgresEndpoints",
+		"PostgresCatalogs",
+		"PostgresDatabases",
+		"PostgresSyncedTables",
 	}
 
 	diags := bundle.ApplySeq(t.Context(), b, ApplyTargetMode(), ApplyPresets())
@@ -433,28 +559,24 @@ func TestAllNonUcResourcesAreRenamed(t *testing.T) {
 	resources := reflect.ValueOf(b.Config.Resources)
 	for i := range resources.NumField() {
 		field := resources.Field(i)
+		if field.Kind() != reflect.Map {
+			continue
+		}
+		resourceType := resources.Type().Field(i).Name
+		if slices.Contains(notUserNamed, resourceType) {
+			continue
+		}
+		for _, key := range field.MapKeys() {
+			resource := field.MapIndex(key)
+			nameField := resource.Elem().FieldByName("Name")
+			if !nameField.IsValid() || nameField.Kind() != reflect.String {
+				continue
+			}
 
-		if field.Kind() == reflect.Map {
-			for _, key := range field.MapKeys() {
-				resource := field.MapIndex(key)
-				nameField := resource.Elem().FieldByName("Name")
-				resourceType := resources.Type().Field(i).Name
-
-				// Skip resources that are not renamed (either because they don't have a user-facing Name field,
-				// or because their Name is server-generated rather than user-specified)
-				if resourceType == "Apps" || resourceType == "SecretScopes" || resourceType == "DatabaseInstances" || resourceType == "DatabaseCatalogs" || resourceType == "SyncedDatabaseTables" || resourceType == "PostgresProjects" || resourceType == "PostgresBranches" || resourceType == "PostgresEndpoints" {
-					continue
-				}
-
-				if !nameField.IsValid() || nameField.Kind() != reflect.String {
-					continue
-				}
-
-				if slices.Contains(ucFields, resource.Type()) {
-					assert.NotContains(t, nameField.String(), "dev", "process_target_mode should not rename '%s' in '%s'", key, resources.Type().Field(i).Name)
-				} else {
-					assert.Contains(t, nameField.String(), "dev", "process_target_mode should rename '%s' in '%s'", key, resources.Type().Field(i).Name)
-				}
+			if slices.Contains(notRenamedFields, resource.Type()) {
+				assert.NotContains(t, nameField.String(), "dev", "process_target_mode should not rename '%s' in '%s'", key, resourceType)
+			} else {
+				assert.Contains(t, nameField.String(), "dev", "process_target_mode should rename '%s' in '%s'", key, resourceType)
 			}
 		}
 	}
@@ -553,5 +675,5 @@ func TestPipelinesDevelopmentDisabled(t *testing.T) {
 	diags := bundle.ApplySeq(t.Context(), b, ApplyTargetMode(), ApplyPresets())
 	require.NoError(t, diags.Error())
 
-	assert.False(t, b.Config.Resources.Pipelines["pipeline1"].Development)
+	assert.False(t, b.Config.Resources.Pipelines["pipeline1"].Development) //nolint:staticcheck // SA1019: pipeline development is deprecated in the SDK but remains a supported bundle config field
 }

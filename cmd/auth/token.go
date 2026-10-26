@@ -12,33 +12,30 @@ import (
 	"github.com/databricks/cli/cmd/root"
 	"github.com/databricks/cli/libs/auth"
 	"github.com/databricks/cli/libs/auth/storage"
+	"github.com/databricks/cli/libs/auth/u2m"
 	"github.com/databricks/cli/libs/browser"
 	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/databrickscfg"
 	"github.com/databricks/cli/libs/databrickscfg/profile"
 	"github.com/databricks/cli/libs/env"
 	"github.com/databricks/cli/libs/flags"
+	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/databricks-sdk-go/config"
-	"github.com/databricks/databricks-sdk-go/credentials/u2m"
-	"github.com/databricks/databricks-sdk-go/credentials/u2m/cache"
 	"github.com/spf13/cobra"
 	"golang.org/x/oauth2"
 )
+
+const unauthenticatedErrorCode = "UNAUTHENTICATED"
+
+type tokenErrorOutput struct {
+	ErrorCode string `json:"error_code"`
+	Message   string `json:"message"`
+}
 
 func helpfulError(ctx context.Context, profile string, persistentAuth u2m.OAuthArgument) string {
 	loginMsg := auth.BuildLoginCommand(ctx, profile, persistentAuth)
 	return fmt.Sprintf("Try logging in again with `%s` before retrying. If this fails, please report this issue to the Databricks CLI maintainers at https://github.com/databricks/cli/issues/new", loginMsg)
 }
-
-// profileSelectionResult represents the user's choice from the interactive
-// profile picker.
-type profileSelectionResult int
-
-const (
-	profileSelected   profileSelectionResult = iota // User picked a profile
-	enterHostSelected                               // User chose "Enter a host URL manually"
-	createNewSelected                               // User chose "Create a new profile"
-)
 
 func newTokenCommand(authArguments *auth.AuthArguments) *cobra.Command {
 	cmd := &cobra.Command{
@@ -65,7 +62,7 @@ and secret is not supported.`,
 		ctx := cmd.Context()
 		profileName := cmd.Flag("profile").Value.String()
 
-		tokenCache, mode, err := storage.ResolveCache(ctx, "")
+		tokenStore, mode, err := storage.ResolveStore(ctx, "")
 		if err != nil {
 			return err
 		}
@@ -77,11 +74,19 @@ and secret is not supported.`,
 			tokenTimeout:       tokenTimeout,
 			forceRefresh:       forceRefresh,
 			profiler:           profile.DefaultProfiler,
-			tokenCache:         tokenCache,
+			tokenStore:         tokenStore,
 			mode:               mode,
 			persistentAuthOpts: nil,
 		})
 		if err != nil {
+			if cmd.Flag("output").Changed && root.OutputType(cmd) == flags.OutputJSON {
+				if _, ok := errors.AsType[*u2m.InvalidRefreshTokenError](err); ok {
+					if outputErr := writeTokenErrorOutput(cmd.OutOrStdout(), err); outputErr != nil {
+						return outputErr
+					}
+					return root.ErrAlreadyPrinted
+				}
+			}
 			return err
 		}
 		// Only honor the explicit --output text flag, not implicit text mode
@@ -108,6 +113,15 @@ func writeTokenOutput(w io.Writer, t *oauth2.Token, textMode bool) error {
 	return err
 }
 
+func writeTokenErrorOutput(w io.Writer, err error) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(tokenErrorOutput{
+		ErrorCode: unauthenticatedErrorCode,
+		Message:   err.Error(),
+	})
+}
+
 type loadTokenArgs struct {
 	// authArguments is the parsed auth arguments, including the host and optionally the account ID.
 	authArguments *auth.AuthArguments
@@ -127,9 +141,9 @@ type loadTokenArgs struct {
 	// profiler is the profiler to use for reading the host and account ID from the .databrickscfg file.
 	profiler profile.Profiler
 
-	// tokenCache is the underlying TokenCache used for OAuth tokens. The caller is
-	// responsible for construction so that tests can substitute an in-memory cache.
-	tokenCache cache.TokenCache
+	// tokenStore is the underlying CLI store used for OAuth tokens. The caller is
+	// responsible for construction so that tests can substitute an in-memory store.
+	tokenStore storage.Store
 
 	// mode is the resolved storage mode. When set to StorageModePlaintext,
 	// login paths mirror freshly minted tokens under the legacy host-based
@@ -185,7 +199,7 @@ func loadToken(ctx context.Context, args loadTokenArgs) (*oauth2.Token, error) {
 	// resolve the target through environment variables or interactive profile selection.
 	if args.profileName == "" && args.authArguments.Host == "" && len(args.args) == 0 {
 		var resolvedProfile string
-		resolvedProfile, existingProfile, err = resolveNoArgsToken(ctx, args.profiler, args.authArguments, args.tokenCache, args.mode)
+		resolvedProfile, existingProfile, err = resolveNoArgsToken(ctx, args.profiler, args.authArguments, args.tokenStore, args.mode)
 		if err != nil {
 			return nil, err
 		}
@@ -200,11 +214,11 @@ func loadToken(ctx context.Context, args loadTokenArgs) (*oauth2.Token, error) {
 	// When no profile was specified, resolve the host to a profile in
 	// .databrickscfg. This ensures the token cache lookup uses the profile
 	// key (e.g. "logfood") rather than the host URL, which is important
-	// because the SDK's dualWrite is a transitional mechanism: it writes
-	// tokens under both keys for backward compatibility with older SDKs
+	// because the store's dual-write wrapper is a transitional mechanism: it
+	// writes tokens under both keys for backward compatibility with older SDKs
 	// that only know host keys, but the profile key is the intended
 	// primary key. Once older SDKs have migrated to profile-based keys,
-	// dualWrite and the host key can be removed entirely.
+	// dual-writing and the host key can be removed entirely.
 	if args.profileName == "" && args.authArguments.Host != "" {
 		// Match profiles by host and available identifiers. For SPOG workspace
 		// profiles (host + account_id + workspace_id), use all three to
@@ -273,7 +287,13 @@ func loadToken(ctx context.Context, args loadTokenArgs) (*oauth2.Token, error) {
 	if err != nil {
 		return nil, err
 	}
-	allArgs := append([]u2m.PersistentAuthOption{u2m.WithTokenCache(args.tokenCache)}, args.persistentAuthOpts...)
+	allArgs := append([]u2m.PersistentAuthOption{u2m.WithTokenStore(storage.OAuthTokenStore(ctx, args.tokenStore, args.mode))}, args.persistentAuthOpts...)
+	if clientID := u2mClientIDFromProfile(existingProfile); clientID != "" {
+		allArgs = append(allArgs, u2m.WithClientID(clientID))
+	}
+	if resources := u2mResourcesFromProfile(existingProfile); len(resources) > 0 {
+		allArgs = append(allArgs, u2m.WithResources(resources))
+	}
 	allArgs = append(allArgs, u2m.WithOAuthArgument(oauthArgument))
 	persistentAuth, err := u2m.NewPersistentAuth(ctx, allArgs...)
 	if err != nil {
@@ -287,17 +307,29 @@ func loadToken(ctx context.Context, args loadTokenArgs) (*oauth2.Token, error) {
 		t, err = persistentAuth.Token()
 	}
 	if err != nil {
-		if errors.Is(err, cache.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			// The error returned by the SDK when the token cache doesn't exist or doesn't contain a token
 			// for the given host changed in SDK v0.77.0: https://github.com/databricks/databricks-sdk-go/pull/1250.
 			// This was released as part of CLI v0.264.0.
 			//
 			// Older SDK versions check for a particular substring to determine if
 			// the OAuth authentication type can fall through or if it is a real error.
-			// This means we need to keep this error message constant for backwards compatibility.
+			// This means we need to keep "databricks OAuth is not configured for
+			// this host" present in the error for backwards compatibility.
 			//
 			// This is captured in an acceptance test under "cmd/auth/token".
-			err = errors.New("cache: databricks OAuth is not configured for this host")
+			const compatSubstring = "databricks OAuth is not configured for this host"
+			// When storage's notFoundHintCache wrapped the ErrNotFound with
+			// an actionable hint (e.g. the post-upgrade "stored credentials
+			// from older CLI versions are no longer used; run `databricks
+			// auth login`..." copy), surface it instead of the generic
+			// "Try logging in again with ... If this fails, please report
+			// this issue" trailer. The hint is more specific and avoids
+			// users reporting expected post-upgrade behavior as a bug.
+			if hint := storage.HintForNotFound(err); hint != "" {
+				return nil, fmt.Errorf("cache: %s. %s", compatSubstring, hint)
+			}
+			err = errors.New("cache: " + compatSubstring)
 		}
 		if rewritten, rewrittenErr := auth.RewriteAuthError(ctx, args.authArguments.Host, args.authArguments.AccountID, args.profileName, err); rewritten {
 			return nil, rewrittenErr
@@ -315,7 +347,7 @@ func loadToken(ctx context.Context, args loadTokenArgs) (*oauth2.Token, error) {
 //
 // Returns the resolved profile name and profile (if any). The host and related
 // fields on authArgs are updated in place when resolved via environment variables.
-func resolveNoArgsToken(ctx context.Context, profiler profile.Profiler, authArgs *auth.AuthArguments, tokenCache cache.TokenCache, mode storage.StorageMode) (string, *profile.Profile, error) {
+func resolveNoArgsToken(ctx context.Context, profiler profile.Profiler, authArgs *auth.AuthArguments, tokenStore storage.Store, mode storage.StorageMode) (string, *profile.Profile, error) {
 	// Step 1: Try DATABRICKS_HOST env var (highest priority).
 	if envHost := env.Get(ctx, "DATABRICKS_HOST"); envHost != "" {
 		authArgs.Host = envHost
@@ -337,6 +369,18 @@ func resolveNoArgsToken(ctx context.Context, profiler profile.Profiler, authArgs
 		return envProfile, p, nil
 	}
 
+	// Step 2.5: Try [__settings__].default_profile from the config file.
+	// default_profile is advisory: if it points at a profile that no longer
+	// exists, fall through to the interactive picker rather than erroring.
+	if defaultProfile := databrickscfg.ResolveDefaultProfile(ctx); defaultProfile != "" {
+		p, err := loadProfileByName(ctx, defaultProfile, profiler)
+		if err != nil {
+			log.Warnf(ctx, "default_profile %q not loadable: %v", defaultProfile, err)
+		} else if p != nil {
+			return defaultProfile, p, nil
+		}
+	}
+
 	// Step 3: No env vars resolved. Load all profiles for interactive selection
 	// or non-interactive error.
 	allProfiles, err := profiler.LoadProfiles(ctx, profile.MatchAllProfiles)
@@ -352,16 +396,21 @@ func resolveNoArgsToken(ctx context.Context, profiler profile.Profiler, authArgs
 	}
 
 	// Interactive: show profile picker.
-	result, selectedName, err := promptForProfileSelection(ctx, allProfiles)
+	currentDefault, _ := databrickscfg.GetDefaultProfile(ctx, env.Get(ctx, "DATABRICKS_CONFIG_FILE"))
+	result, selectedName, err := pickAuthProfile(ctx, allProfiles, profilePickerOptions{
+		Label:         "Select a profile",
+		Default:       currentDefault,
+		IncludeExtras: true,
+	})
 	if err != nil {
 		return "", nil, err
 	}
 	switch result {
-	case enterHostSelected:
+	case profilePickerEnterHost:
 		// Fall through — setHostAndAccountId will prompt for the host.
 		return "", nil, nil
-	case createNewSelected:
-		return runInlineLogin(ctx, profiler, tokenCache, mode)
+	case profilePickerCreateNew:
+		return runInlineLogin(ctx, profiler, tokenStore, mode)
 	default:
 		p, err := loadProfileByName(ctx, selectedName, profiler)
 		if err != nil {
@@ -371,59 +420,10 @@ func resolveNoArgsToken(ctx context.Context, profiler profile.Profiler, authArgs
 	}
 }
 
-// profileSelectItem is used by promptForProfileSelection to render both
-// regular profiles and special action options in the same select list.
-type profileSelectItem struct {
-	Name string
-	Host string
-}
-
-// promptForProfileSelection shows a select list with all configured profiles
-// plus "Enter a host URL" and "Create a new profile" options.
-// Returns the selection type and, when a profile is selected, its name.
-func promptForProfileSelection(ctx context.Context, profiles profile.Profiles) (profileSelectionResult, string, error) {
-	items := make([]profileSelectItem, 0, len(profiles)+2)
-	for _, p := range profiles {
-		items = append(items, profileSelectItem{Name: p.Name, Host: p.Host})
-	}
-	createProfileIdx := len(items)
-	items = append(items, profileSelectItem{Name: "Create a new profile"})
-	enterHostIdx := len(items)
-	items = append(items, profileSelectItem{Name: "Enter a host URL manually"})
-
-	i, err := cmdio.RunSelect(ctx, cmdio.SelectOptions{
-		Label:             "Select a profile",
-		Items:             items,
-		StartInSearchMode: len(profiles) > 5,
-		Searcher: func(input string, index int) bool {
-			input = strings.ToLower(input)
-			name := strings.ToLower(items[index].Name)
-			host := strings.ToLower(items[index].Host)
-			return strings.Contains(name, input) || strings.Contains(host, input)
-		},
-		LabelTemplate: "{{ . | faint }}",
-		Active:        `{{.Name | bold}}{{if .Host}} ({{.Host|faint}}){{end}}`,
-		Inactive:      `{{.Name}}{{if .Host}} ({{.Host}}){{end}}`,
-		Selected:      `{{ "Using profile" | faint }}: {{ .Name | bold }}`,
-	})
-	if err != nil {
-		return 0, "", err
-	}
-
-	switch i {
-	case enterHostIdx:
-		return enterHostSelected, "", nil
-	case createProfileIdx:
-		return createNewSelected, "", nil
-	default:
-		return profileSelected, profiles[i].Name, nil
-	}
-}
-
 // runInlineLogin runs a minimal interactive login flow: prompts for a profile
 // name and host, performs the OAuth challenge, saves the profile to
 // .databrickscfg, and returns the new profile name and profile.
-func runInlineLogin(ctx context.Context, profiler profile.Profiler, tokenCache cache.TokenCache, mode storage.StorageMode) (string, *profile.Profile, error) {
+func runInlineLogin(ctx context.Context, profiler profile.Profiler, tokenStore storage.Store, mode storage.StorageMode) (string, *profile.Profile, error) {
 	profileName, err := promptForProfile(ctx, "DEFAULT")
 	if err != nil {
 		return "", nil, err
@@ -450,6 +450,10 @@ func runInlineLogin(ctx context.Context, profiler profile.Profiler, tokenCache c
 		scopesList = splitScopes(existingProfile.Scopes)
 	}
 
+	// Preserve RFC 8707 resource indicators from the existing profile so the
+	// inline login requests the same resources the user previously configured.
+	resourcesList := u2mResourcesFromProfile(existingProfile)
+
 	oauthArgument, err := loginArgs.ToOAuthArgument()
 	if err != nil {
 		return "", nil, err
@@ -457,10 +461,15 @@ func runInlineLogin(ctx context.Context, profiler profile.Profiler, tokenCache c
 	persistentAuthOpts := []u2m.PersistentAuthOption{
 		u2m.WithOAuthArgument(oauthArgument),
 		u2m.WithBrowser(func(url string) error { return browser.Open(ctx, url) }),
-		u2m.WithTokenCache(storage.WrapForOAuthArgument(tokenCache, mode, oauthArgument)),
+	}
+	if clientID := u2mClientIDFromProfile(existingProfile); clientID != "" {
+		persistentAuthOpts = append(persistentAuthOpts, u2m.WithClientID(clientID))
 	}
 	if len(scopesList) > 0 {
 		persistentAuthOpts = append(persistentAuthOpts, u2m.WithScopes(scopesList))
+	}
+	if len(resourcesList) > 0 {
+		persistentAuthOpts = append(persistentAuthOpts, u2m.WithResources(resourcesList))
 	}
 	persistentAuth, err := u2m.NewPersistentAuth(ctx, persistentAuthOpts...)
 	if err != nil {
@@ -471,7 +480,8 @@ func runInlineLogin(ctx context.Context, profiler profile.Profiler, tokenCache c
 	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
 
-	if err = persistentAuth.Challenge(); err != nil {
+	token, err := persistentAuth.Challenge()
+	if err != nil {
 		return "", nil, err
 	}
 
@@ -486,8 +496,18 @@ func runInlineLogin(ctx context.Context, profiler profile.Profiler, tokenCache c
 		WorkspaceID: loginArgs.WorkspaceID,
 		ConfigFile:  env.Get(ctx, "DATABRICKS_CONFIG_FILE"),
 		Scopes:      scopesList,
+		ClientID:    u2mClientIDFromProfile(existingProfile),
 	}, clearKeys...)
 	if err != nil {
+		return "", nil, err
+	}
+	// TODO: resources is not supported in the SDK yet. This function is
+	// a short-cut to add the property to the profile until it is supported
+	// in the SDK.
+	if err := databrickscfg.SaveResourcesToProfile(ctx, profileName, env.Get(ctx, "DATABRICKS_CONFIG_FILE"), resourcesList); err != nil {
+		return "", nil, err
+	}
+	if err := storeLoginToken(ctx, tokenStore, mode, oauthArgument, token); err != nil {
 		return "", nil, err
 	}
 

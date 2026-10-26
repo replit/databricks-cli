@@ -13,9 +13,21 @@ import (
 
 type SqlWarehouse struct {
 	BaseResource
+	ID string `json:"id,omitempty" bundle:"readonly"`
 	sql.CreateWarehouseRequest
 
+	// Lifecycle shadows BaseResource.Lifecycle to add support for lifecycle.started.
+	Lifecycle *LifecycleWithStarted `json:"lifecycle,omitempty"`
+
 	Permissions []SqlWarehousePermission `json:"permissions,omitempty"`
+}
+
+// GetLifecycle returns the lifecycle settings, using LifecycleWithStarted.
+func (sw *SqlWarehouse) GetLifecycle() LifecycleConfig {
+	if sw.Lifecycle == nil {
+		return LifecycleWithStarted{}
+	}
+	return *sw.Lifecycle
 }
 
 func (sw *SqlWarehouse) UnmarshalJSON(b []byte) error {
@@ -53,8 +65,4 @@ func (sw *SqlWarehouse) InitializeURL(baseURL url.URL) {
 
 func (sw *SqlWarehouse) GetName() string {
 	return sw.Name
-}
-
-func (sw *SqlWarehouse) GetURL() string {
-	return sw.URL
 }

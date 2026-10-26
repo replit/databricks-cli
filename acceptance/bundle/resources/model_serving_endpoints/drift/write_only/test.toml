@@ -1,0 +1,4 @@
+RecordRequests = true
+
+# Scope this regression to the direct engine where the classification lives;
+# terraform models these write-only fields differently.

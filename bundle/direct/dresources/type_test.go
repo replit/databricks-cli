@@ -16,68 +16,51 @@ import (
 // These are known issues that should be fixed. If a field listed here is found in RemoteType,
 // the test fails to ensure the entry is removed from this map.
 var knownMissingInRemoteType = map[string][]string{
-	"clusters": {
-		"apply_policy_default_values",
-	},
 	"external_locations": {
 		"skip_validation",
 	},
 	"model_serving_endpoints": {
-		"ai_gateway",
-		"budget_policy_id",
-		"config",
-		"description",
-		"email_notifications",
-		"name",
 		"rate_limits",
-		"route_optimized",
-		"tags",
+	},
+	"pipelines": {
+		// Note that this is a deliberate omission: cascade_on_destroy is a client-side-only field.
+		// It has no remote counterpart, so it is never expected in RemoteType.
+		"cascade_on_destroy",
 	},
 	"quality_monitors": {
 		"skip_builtin_dashboard",
 		"warehouse_id",
 	},
 	"secret_scopes": {
-		"backend_azure_keyvault",
 		"initial_manage_principal",
-		"scope",
-		"scope_backend_type",
 	},
 	"postgres_branches": {
-		"branch_id",
-		"expire_time",
-		"is_protected",
-		"no_expiry",
-		"source_branch",
-		"source_branch_lsn",
-		"source_branch_time",
-		"ttl",
+		"replace_existing",
+		"purge_on_delete",
+	},
+	"postgres_databases": {
+		"replace_existing",
 	},
 	"postgres_endpoints": {
-		"autoscaling_limit_max_cu",
-		"autoscaling_limit_min_cu",
-		"disabled",
-		"endpoint_id",
-		"endpoint_type",
-		"group",
-		"no_suspension",
-		"settings",
-		"suspend_timeout_duration",
+		"replace_existing",
+	},
+	"postgres_roles": {
+		"replace_existing",
 	},
 	"postgres_projects": {
-		"budget_policy_id",
-		"custom_tags",
-		"default_branch",
-		"default_endpoint_settings",
-		"display_name",
-		"enable_pg_native_login",
-		"history_retention_duration",
-		"pg_version",
-		"project_id",
+		"purge_on_delete",
 	},
 	"vector_search_endpoints": {
-		"min_qps",
 		"usage_policy_id",
+	},
+	"internal_immutable_snapshots": {
+		"bundle_id",
+		"acl",
+		"zip_path",
+	},
+	"job_runs": {
+		// Local-only trigger fingerprints under lifecycle.
+		"lifecycle",
 	},
 }
 
@@ -99,13 +82,32 @@ var knownMissingInStateType = map[string][]string{
 	"apps": {
 		"lifecycle.prevent_destroy",
 	},
+	"clusters": {
+		"lifecycle.prevent_destroy",
+	},
+	"sql_warehouses": {
+		"lifecycle.prevent_destroy",
+	},
+	"job_runs": {
+		// State stores trigger fingerprints, not the config trigger list / prevent_destroy.
+		"lifecycle.prevent_destroy",
+		"lifecycle.triggers",
+	},
 	"dashboards": {
+		"file_path",
+	},
+	"genie_spaces": {
 		"file_path",
 	},
 	"secret_scopes": {
 		"backend_type",
 		"keyvault_metadata",
 		"name",
+	},
+	"internal_immutable_snapshots": {
+		// RemoteRoot is only the input used to compose FullPath; the state persists
+		// the composed FullPath (and RelativePath), so it isn't kept in state.
+		"remote_root",
 	},
 }
 

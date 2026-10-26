@@ -11,6 +11,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/cli/libs/dyn/convert"
 
 	"github.com/databricks/cli/bundle/env"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/databricks/cli/bundle"
 	"github.com/databricks/cli/bundle/config"
+	"github.com/databricks/cli/internal/testutil"
 	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/process"
 	"github.com/stretchr/testify/assert"
@@ -53,7 +55,7 @@ resources:
       name: job_0
 workspace: { current_user: { userName: test }}`)
 
-	// set rootPath so that we can make absolute paths in dyn.Location
+	// set rootPath so that we can make absolute paths in diag.Location
 	b.BundleRootPath = rootPath
 
 	ctx := withProcessStub(
@@ -123,7 +125,7 @@ workspace: { current_user: { userName: test }}`)
 		// location is databricks.yml, because output contains resource as-is
 		jobName0, err := dyn.GetByPath(v, dyn.MustPathFromString("resources.jobs.job0.name"))
 		require.NoError(t, err)
-		assert.Equal(t, []dyn.Location{
+		assert.Equal(t, []diag.Location{
 			{
 				File:   "databricks.yml",
 				Line:   9,
@@ -133,7 +135,7 @@ workspace: { current_user: { userName: test }}`)
 
 		jobName1, err := dyn.GetByPath(v, dyn.MustPathFromString("resources.jobs.job1.name"))
 		require.NoError(t, err)
-		assert.Equal(t, []dyn.Location{
+		assert.Equal(t, []diag.Location{
 			{
 				File:   filepath.Join(rootPath, "src/examples/job1.py"),
 				Line:   5,
@@ -143,7 +145,7 @@ workspace: { current_user: { userName: test }}`)
 
 		pipelineName0, err := dyn.GetByPath(v, dyn.MustPathFromString("resources.pipelines.pipeline0.name"))
 		require.NoError(t, err)
-		assert.Equal(t, []dyn.Location{
+		assert.Equal(t, []diag.Location{
 			{
 				File:   filepath.Join(rootPath, "src/examples/pipeline0.py"),
 				Line:   7,
@@ -158,9 +160,9 @@ workspace: { current_user: { userName: test }}`)
 	assert.Equal(t, int64(2), b.Metrics.PythonAddedResourcesCount)
 	assert.Equal(t, int64(0), b.Metrics.PythonUpdatedResourcesCount)
 
-	assert.Equal(t, 1, len(diags))
+	assert.Len(t, diags, 1)
 	assert.Equal(t, "job doesn't have any tasks", diags[0].Summary)
-	assert.Equal(t, []dyn.Location{
+	assert.Equal(t, []diag.Location{
 		{
 			File:   "src/examples/file.py",
 			Line:   10,
@@ -471,6 +473,34 @@ func TestStrictNormalize(t *testing.T) {
 	assert.True(t, strictDiags.HasError())
 }
 
+func TestCreateCacheDir(t *testing.T) {
+	testutil.CleanupEnvironment(t)
+
+	t.Run("DATABRICKS_BUNDLE_TMP is set", func(t *testing.T) {
+		tempDir := t.TempDir()
+		t.Setenv(env.TempDirVariable, tempDir)
+
+		cacheDir, cleanup, err := createCacheDir(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, filepath.Join(tempDir, "default", "python"), cacheDir)
+
+		cleanup()
+
+		// user-specified directories are kept for inspection
+		assert.DirExists(t, cacheDir)
+	})
+
+	t.Run("DATABRICKS_BUNDLE_TMP is not set", func(t *testing.T) {
+		cacheDir, cleanup, err := createCacheDir(t.Context())
+		require.NoError(t, err)
+		require.DirExists(t, cacheDir)
+
+		cleanup()
+
+		assert.NoDirExists(t, cacheDir)
+	})
+}
+
 func TestExplainProcessErr(t *testing.T) {
 	stderr := "/home/test/.venv/bin/python3: Error while finding module specification for 'databricks.bundles.build' (ModuleNotFoundError: No module named 'databricks')\n"
 	expected := `/home/test/.venv/bin/python3: Error while finding module specification for 'databricks.bundles.build' (ModuleNotFoundError: No module named 'databricks')
@@ -501,7 +531,7 @@ func withProcessStub(t *testing.T, args []string, output, diagnostics, locations
 	t.Setenv(env.TempDirVariable, t.TempDir())
 
 	// after we override env variable, we always get the same cache dir as mutator
-	cacheDir, err := createCacheDir(ctx)
+	cacheDir, _, err := createCacheDir(ctx)
 	require.NoError(t, err)
 
 	inputPath := filepath.Join(cacheDir, "input.json")

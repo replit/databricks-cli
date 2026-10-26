@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+
+	"github.com/databricks/cli/libs/diag"
 )
 
 type Value struct {
@@ -14,7 +16,7 @@ type Value struct {
 	// List of locations this value is defined at. The first location in the slice
 	// is the location returned by the `.Location()` method and is typically used
 	// for reporting errors and warnings associated with the value.
-	l []Location
+	l []diag.Location
 
 	// Whether or not this value is an anchor.
 	// If this node doesn't map to a type, we don't need to warn about it.
@@ -37,7 +39,7 @@ func V(v any) Value {
 }
 
 // NewValue constructs a new Value with the given value and location.
-func NewValue(v any, loc []Location) Value {
+func NewValue(v any, loc []diag.Location) Value {
 	switch vin := v.(type) {
 	case map[string]Value:
 		v = newMappingFromGoMap(vin)
@@ -54,7 +56,7 @@ func NewValue(v any, loc []Location) Value {
 }
 
 // WithLocations returns a new Value with its location set to the given value.
-func (v Value) WithLocations(loc []Location) Value {
+func (v Value) WithLocations(loc []diag.Location) Value {
 	return Value{
 		v: v.v,
 		k: v.k,
@@ -81,13 +83,13 @@ func (v Value) Value() any {
 	return v.v
 }
 
-func (v Value) Locations() []Location {
+func (v Value) Locations() []diag.Location {
 	return v.l
 }
 
-func (v Value) Location() Location {
+func (v Value) Location() diag.Location {
 	if len(v.l) == 0 {
-		return Location{}
+		return diag.Location{}
 	}
 
 	return v.l[0]
@@ -206,9 +208,20 @@ func (v Value) eq(w Value) bool {
 
 	switch v.k {
 	case KindMap:
-		// Compare pointers to the underlying map.
+		// Comparing &v.v to &w.v is always false (value receivers), so compare the Mapping's backing storage.
+		vm := v.v.(Mapping)
+		wm := w.v.(Mapping)
+		lv := vm.Len()
+		lw := wm.Len()
+		if lv == 0 && lw == 0 {
+			return true
+		}
+		if lv != lw {
+			return false
+		}
+		// Compare pointers to the underlying pairs slice.
 		// This is safe because we don't allow maps to be mutated.
-		return &v.v == &w.v
+		return &vm.pairs[0] == &wm.pairs[0]
 	case KindSequence:
 		vs := v.v.([]Value)
 		ws := w.v.([]Value)

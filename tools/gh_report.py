@@ -8,17 +8,16 @@ Download integration logs artifacts for a given run id (--run RUNID) or commit (
 If neither --commit nor --run are passed, will use either current PR or HEAD.
 """
 
-import sys
-import os
-import subprocess
 import argparse
 import json
+import os
 import pprint
+import subprocess
+import sys
+import threading
 import time
 import urllib.request
-import threading
 from pathlib import Path
-
 
 CLI_REPO = "databricks/cli"
 DECO_REPO = os.environ.get("DECO_REPO") or os.environ.get("GITHUB_REPOSITORY")
@@ -37,6 +36,123 @@ except Exception:
 def run(cmd, shell=False):
     sys.stderr.write("+ " + " ".join(cmd) + "\n")
     return subprocess.run(cmd, check=True, shell=False)
+
+
+# The check-run API rejects output.text over 65535 characters, and the update-check
+# action in eng-dev-ecosystem passes the report to `gh` as a single argument, which
+# fails exec() above 128KB. Keep the markdown report safely under both limits.
+MAX_MARKDOWN_SIZE = 60_000
+
+
+def find_tables(lines):
+    """Return (start, end) line ranges of consecutive markdown table lines.
+
+    >>> find_tables(["intro", "| a |", "| - |", "| 1 |", "", "| b |"])
+    [(1, 4), (5, 6)]
+
+    Empty input returns no tables:
+    >>> find_tables([])
+    []
+
+    Single table spans entire input:
+    >>> find_tables(["| a |", "| - |", "| 1 |"])
+    [(0, 3)]
+
+    Table at start:
+    >>> find_tables(["| x |", "| - |", "text"])
+    [(0, 2)]
+
+    Table at end:
+    >>> find_tables(["text", "| y |", "| - |"])
+    [(1, 3)]
+
+    No tables returns empty:
+    >>> find_tables(["line1", "line2", "line3"])
+    []
+    """
+    tables = []
+    start = None
+    for i, line in enumerate([*lines, ""]):
+        if line.startswith("|"):
+            if start is None:
+                start = i
+        elif start is not None:
+            tables.append((start, i))
+            start = None
+    return tables
+
+
+def trim_tables(text, limit=MAX_MARKDOWN_SIZE):
+    r"""Drop rows from the end of the largest markdown table until the report fits in limit bytes.
+
+    Reports under the limit are returned unchanged:
+
+    >>> trim_tables("| a |\n| b |", limit=100)
+    '| a |\n| b |'
+
+    Oversized reports lose trailing table rows and gain a note about it:
+
+    >>> rows = [f"| row {i:02d} |" for i in range(1, 21)]
+    >>> report = "\n".join(["intro"] + rows + ["outro"])
+    >>> len(report.encode())
+    231
+    >>> print(trim_tables(report, limit=180))
+    intro
+    | row 01 |
+    | row 02 |
+    | row 03 |
+    | row 04 |
+    | row 05 |
+    | row 06 |
+    outro
+    (14 table rows omitted to keep the report under 180 bytes)
+
+    Empty text fits any limit:
+    >>> trim_tables("", limit=10)
+    ''
+
+    Text with no tables (below limit) is unchanged:
+    >>> trim_tables("just text", limit=100)
+    'just text'
+
+    Trimming prioritizes the largest table:
+    >>> big_table = "\n".join(["| row |"] * 15)
+    >>> small_table = "\n".join(["| x |"] * 2)
+    >>> report = big_table + "\n" + small_table
+    >>> result = trim_tables(report, limit=50)
+    >>> "table rows omitted" in result
+    True
+    >>> "| row |" in result  # big table partially preserved
+    True
+
+    Header and separator rows are always kept:
+    >>> table = "| Header |\n| --- |\n| row 1 |\n| row 2 |\n| row 3 |"
+    >>> result = trim_tables(table, limit=40)
+    >>> "| --- |" in result  # separator always present
+    True
+    >>> "| Header |" in result  # header always present
+    True
+    """
+    size = len(text.encode())
+    if size <= limit:
+        return text
+    lines = text.split("\n")
+    budget = limit - 100  # reserve room for the omission note
+    omitted = 0
+    while size > budget:
+        # Keep at least header, separator and one data row per table.
+        tables = [(s, e) for (s, e) in find_tables(lines) if e - s > 3]
+        if not tables:
+            break
+        start, end = max(tables, key=lambda t: t[1] - t[0])
+        while end - start > 3 and size > budget:
+            end -= 1
+            size -= len(lines[end].encode()) + 1
+            del lines[end]
+            omitted += 1
+    if omitted:
+        lines.append(f"({omitted} table rows omitted to keep the report under {limit} bytes)")
+    return "\n".join(lines)
 
 
 def run_text(cmd, print_command=False):
@@ -171,6 +287,9 @@ def main():
     parser.add_argument("--output", help="Show output for failing tests", action="store_true")
     parser.add_argument("--markdown", help="Output in GitHub-flavored markdown format", action="store_true")
     parser.add_argument(
+        "--notrim", help=f"Do not trim markdown report to {MAX_MARKDOWN_SIZE} bytes", action="store_true"
+    )
+    parser.add_argument(
         "--omit-repl",
         help="Omit lines starting with 'REPL' and containing 'Available replacements:'",
         action="store_true",
@@ -218,7 +337,10 @@ def main():
     if args.omit_repl:
         cmd.append("--omit-repl")
     cmd.append(f"{target_dir}")
-    run(cmd, shell=True)
+    report = run_text(cmd, print_command=True)
+    if args.markdown and not args.notrim:
+        report = trim_tables(report)
+    print(report)
 
 
 if __name__ == "__main__":

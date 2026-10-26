@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/databricks/cli/bundle"
+	"github.com/databricks/cli/bundle/deploy/snapshot"
 	"github.com/databricks/cli/bundle/deployplan"
 	"github.com/databricks/cli/bundle/phases"
 	"github.com/databricks/cli/cmd/bundle/utils"
@@ -27,11 +28,15 @@ It is useful for previewing changes before running 'bundle deploy'.`,
 	}
 
 	var force bool
+	var quiet int
 	var clusterId string
+	var selectResources []string
 	cmd.Flags().BoolVar(&force, "force", false, "Force-override Git branch validation.")
+	cmd.Flags().CountVarP(&quiet, "quiet", "q", "Reduce output: -q prints only the summary, -qq prints nothing on success.")
 	cmd.Flags().StringVar(&clusterId, "compute-id", "", "Override cluster in the deployment with the given compute ID.")
 	cmd.Flags().StringVarP(&clusterId, "cluster-id", "c", "", "Override cluster in the deployment with the given cluster ID.")
 	cmd.Flags().MarkDeprecated("compute-id", "use --cluster-id instead")
+	cmd.Flags().StringSliceVar(&selectResources, "select", nil, "Plan only the specified resource (e.g. 'my_job' or 'jobs.my_job'). Can be repeated or comma-separated.")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		opts := utils.ProcessOptions{
@@ -39,12 +44,9 @@ It is useful for previewing changes before running 'bundle deploy'.`,
 			FastValidate:    true,
 			Build:           true,
 			PreDeployChecks: true,
-		}
-
-		// Only add InitFunc if we need to set force or cluster ID
-		if force || cmd.Flag("compute-id").Changed || cmd.Flag("cluster-id").Changed {
-			opts.InitFunc = func(b *bundle.Bundle) {
+			InitFunc: func(b *bundle.Bundle) {
 				b.Config.Bundle.Force = force
+				b.Select = selectResources
 
 				if cmd.Flag("compute-id").Changed {
 					b.Config.Bundle.ClusterId = clusterId
@@ -53,53 +55,43 @@ It is useful for previewing changes before running 'bundle deploy'.`,
 				if cmd.Flag("cluster-id").Changed {
 					b.Config.Bundle.ClusterId = clusterId
 				}
-			}
+			},
 		}
 
-		b, stateDesc, err := utils.ProcessBundleRet(cmd, opts)
+		b, _, err := utils.ProcessBundleRet(cmd, opts)
 		if err != nil {
 			return err
 		}
 		ctx := cmd.Context()
 
-		plan := phases.RunPlan(ctx, b, stateDesc.Engine)
+		if b.IsImmutableFolder() {
+			bundle.ApplyContext(ctx, b, snapshot.PlanUpload(snapshot.PlanUploadOptions{Clean: true}))
+			if logdiag.HasError(ctx) {
+				return root.ErrAlreadyPrinted
+			}
+		}
+		plan := phases.RunPlan(ctx, b)
 		if logdiag.HasError(ctx) {
 			return root.ErrAlreadyPrinted
 		}
 
-		// Count actions by type and collect formatted actions
-		createCount := 0
-		updateCount := 0
-		deleteCount := 0
-		unchangedCount := 0
-
-		for _, change := range plan.GetActions() {
-			switch change.ActionType {
-			case deployplan.Create:
-				createCount++
-			case deployplan.Update, deployplan.UpdateWithID, deployplan.Resize:
-				updateCount++
-			case deployplan.Delete:
-				deleteCount++
-			case deployplan.Recreate:
-				// A recreate counts as both a delete and a create
-				deleteCount++
-				createCount++
-			case deployplan.Skip, deployplan.Undefined:
-				unchangedCount++
-			}
-		}
+		counts := plan.CountActions()
 
 		out := cmd.OutOrStdout()
 
 		switch root.OutputType(cmd) {
 		case flags.OutputText:
 			// Print summary line and actions to stdout
-			totalChanges := createCount + updateCount + deleteCount
-			if totalChanges > 0 {
+			totalChanges := counts.Create + counts.Change + counts.Delete
+			if totalChanges > 0 && bundle.QuietLevel(quiet) < bundle.QuietSummary {
 				// Print all actions in the order they were processed
 				for _, action := range plan.GetActions() {
 					if action.ActionType == deployplan.Skip {
+						continue
+					}
+					// A state-only delete has no backend effect; keep it in the JSON
+					// plan but omit it from the human-readable action list.
+					if action.IsStateOnlyDelete() {
 						continue
 					}
 					key := strings.TrimPrefix(action.ResourceKey, "resources.")
@@ -107,8 +99,15 @@ It is useful for previewing changes before running 'bundle deploy'.`,
 				}
 				fmt.Fprintln(out)
 			}
+			if bundle.QuietLevel(quiet) >= bundle.QuietAll {
+				break
+			}
 			// Note, this string should not be changed, "bundle deployment migrate" depends on this format:
-			fmt.Fprintf(out, "Plan: %d to add, %d to change, %d to delete, %d unchanged\n", createCount, updateCount, deleteCount, unchangedCount)
+			fmt.Fprintf(out, "Plan: %d to add, %d to change, %d to delete, %d unchanged", counts.Create, counts.Change, counts.Delete, counts.Unchanged)
+			if len(selectResources) > 0 {
+				fmt.Fprintf(out, ", %d not selected", plan.NotSelected)
+			}
+			fmt.Fprintln(out)
 		case flags.OutputJSON:
 			buf, err := json.MarshalIndent(plan, "", "  ")
 			if err != nil {

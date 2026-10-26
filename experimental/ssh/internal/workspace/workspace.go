@@ -10,6 +10,7 @@ import (
 
 	"github.com/databricks/cli/libs/filer"
 	"github.com/databricks/databricks-sdk-go"
+	"github.com/databricks/databricks-sdk-go/service/iam"
 )
 
 const metadataFileName = "metadata.json"
@@ -18,10 +19,18 @@ type WorkspaceMetadata struct {
 	Port int `json:"port"`
 	// ClusterID is required for Driver Proxy websocket connections (for any compute type, including serverless)
 	ClusterID string `json:"cluster_id,omitempty"`
+	// UsagePolicyID records the usage policy the server's job was submitted with, so a
+	// reconnect can tell whether a running server matches the requested usage policy.
+	UsagePolicyID string `json:"usage_policy_id,omitempty"`
+	// KeepDetachedProcesses records whether the server's bootstrap notebook will hold the job
+	// run open for detached processes after the server exits (--keep-detached-processes), so a
+	// reconnect can tell whether a running server honours the requested mode. False, and so
+	// absent, when the session did not ask for it.
+	KeepDetachedProcesses bool `json:"keep_detached_processes,omitempty"`
 }
 
 func getWorkspaceRootDir(ctx context.Context, client *databricks.WorkspaceClient) (string, error) {
-	me, err := client.CurrentUser.Me(ctx)
+	me, err := client.CurrentUser.Me(ctx, iam.MeRequest{})
 	if err != nil {
 		return "", fmt.Errorf("failed to get current user: %w", err)
 	}

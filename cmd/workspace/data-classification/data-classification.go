@@ -30,6 +30,10 @@ func New() *cobra.Command {
 		RunE:    root.ReportUnknownSubcommand,
 	}
 
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
 	// Add methods
 	cmd.AddCommand(newCreateCatalogConfig())
 	cmd.AddCommand(newDeleteCatalogConfig())
@@ -63,6 +67,7 @@ func newCreateCatalogConfig() *cobra.Command {
 	cmd.Flags().Var(&createCatalogConfigJson, "json", `either inline JSON string or @path/to/file.json with request body`)
 
 	// TODO: array: auto_tag_configs
+	// TODO: complex arg: excluded_schemas
 	// TODO: complex arg: included_schemas
 	cmd.Flags().StringVar(&createCatalogConfigReq.CatalogConfig.Name, "name", createCatalogConfigReq.CatalogConfig.Name, `Resource name in the format: catalogs/{catalog_name}/config.`)
 
@@ -79,6 +84,8 @@ func newCreateCatalogConfig() *cobra.Command {
     PARENT: Parent resource in the format: catalogs/{catalog_name}`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -148,6 +155,8 @@ func newDeleteCatalogConfig() *cobra.Command {
     NAME: Resource name in the format: catalogs/{catalog_name}/config`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -204,6 +213,8 @@ func newGetCatalogConfig() *cobra.Command {
     NAME: Resource name in the format: catalogs/{catalog_name}/config`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -256,6 +267,7 @@ func newUpdateCatalogConfig() *cobra.Command {
 	cmd.Flags().Var(&updateCatalogConfigJson, "json", `either inline JSON string or @path/to/file.json with request body`)
 
 	// TODO: array: auto_tag_configs
+	// TODO: complex arg: excluded_schemas
 	// TODO: complex arg: included_schemas
 	cmd.Flags().StringVar(&updateCatalogConfigReq.CatalogConfig.Name, "name", updateCatalogConfigReq.CatalogConfig.Name, `Resource name in the format: catalogs/{catalog_name}/config.`)
 
@@ -272,6 +284,8 @@ func newUpdateCatalogConfig() *cobra.Command {
     UPDATE_MASK: Field mask specifying which fields to update.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)

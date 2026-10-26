@@ -13,74 +13,53 @@ func TestNewRefNoString(t *testing.T) {
 	require.False(t, ok, "should not match non-string")
 }
 
-func TestNewRefValidPattern(t *testing.T) {
-	for in, refs := range map[string][]string{
-		"${hello_world.world_world}":  {"hello_world.world_world"},
-		"${helloworld.world-world}":   {"helloworld.world-world"},
-		"${hello-world.world-world}":  {"hello-world.world-world"},
-		"${hello_world.world__world}": {"hello_world.world__world"},
-		"${hello_world.world--world}": {"hello_world.world--world"},
-		"${hello_world.world-_world}": {"hello_world.world-_world"},
-		"${hello_world.world_-world}": {"hello_world.world_-world"},
-	} {
-		ref, ok := NewRef(dyn.V(in))
-		require.True(t, ok, "should match valid pattern: %s", in)
-		assert.Equal(t, refs, ref.References())
+func TestNewRefSpans(t *testing.T) {
+	// Spans must point at the unescaped occurrence, not the escaped one that
+	// appears earlier with identical text.
+	ref, ok := NewRef(dyn.V("$${a.b} ${a.b}"))
+	require.True(t, ok)
+	require.Len(t, ref.Matches, 1)
+	require.Len(t, ref.Spans, 1)
+	assert.Equal(t, "${a.b}", ref.Str[ref.Spans[0][0]:ref.Spans[0][1]])
+	assert.Equal(t, 8, ref.Spans[0][0])
+}
+
+func TestContainsVariableReference(t *testing.T) {
+	tests := map[string]bool{
+		"${a.b}":          true,
+		"x ${a.b} y":      true,
+		"$${a.b}":         false,
+		"$${a.b} $${c.d}": false,
+		"$${a.b} ${c.d}":  true,
+		"no refs":         false,
+		"":                false,
+	}
+	for in, want := range tests {
+		assert.Equal(t, want, ContainsVariableReference(in), "input %q", in)
 	}
 }
 
-func TestNewRefInvalidPattern(t *testing.T) {
-	invalid := []string{
-		"${hello_world-.world_world}",   // the first segment ending must not end with hyphen (-)
-		"${hello_world-_.world_world}",  // the first segment ending must not end with underscore (_)
-		"${helloworld.world-world-}",    // second segment must not end with hyphen (-)
-		"${helloworld-.world-world}",    // first segment must not end with hyphen (-)
-		"${helloworld.-world-world}",    // second segment must not start with hyphen (-)
-		"${-hello-world.-world-world-}", // must not start or end with hyphen (-)
-		"${_-_._-_.id}",                 // cannot use _- in sequence
-		"${0helloworld.world-world}",    // interpolated first section shouldn't start with number
-		"${helloworld.9world-world}",    // interpolated second section shouldn't start with number
-	}
-	for _, v := range invalid {
-		_, ok := NewRef(dyn.V(v))
-		require.False(t, ok, "should not match invalid pattern: %s", v)
-	}
+func TestUnescape(t *testing.T) {
+	assert.Equal(t, "${a.b}", Unescape("$${a.b}"))
+	assert.Equal(t, "${a} ${b}", Unescape("$${a} $${b}"))
+	assert.Equal(t, "${a.b}", Unescape("${a.b}"), "already unescaped is unchanged")
+	assert.Equal(t, "no refs", Unescape("no refs"))
 }
 
-func TestIsPureVariableReference(t *testing.T) {
-	assert.False(t, IsPureVariableReference(""))
-	assert.False(t, IsPureVariableReference("${foo.bar} suffix"))
-	assert.False(t, IsPureVariableReference("prefix ${foo.bar}"))
-	assert.True(t, IsPureVariableReference("${foo.bar}"))
-}
-
-func TestPureReferenceToPath(t *testing.T) {
-	for _, tc := range []struct {
-		in  string
-		out string
-		ok  bool
+func TestReplaceRef(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
 	}{
-		{"${foo.bar}", "foo.bar", true},
-		{"${foo.bar.baz}", "foo.bar.baz", true},
-		{"${foo.bar.baz[0]}", "foo.bar.baz[0]", true},
-		{"${foo.bar.baz[0][1]}", "foo.bar.baz[0][1]", true},
-		{"${foo.bar.baz[0][1].qux}", "foo.bar.baz[0][1].qux", true},
-
-		{"${foo.one}${foo.two}", "", false},
-		{"prefix ${foo.bar}", "", false},
-		{"${foo.bar} suffix", "", false},
-		{"${foo.bar", "", false},
-		{"foo.bar}", "", false},
-		{"foo.bar", "", false},
-		{"{foo.bar}", "", false},
-		{"", "", false},
-	} {
-		path, ok := PureReferenceToPath(tc.in)
-		if tc.ok {
-			assert.True(t, ok)
-			assert.Equal(t, dyn.MustPathFromString(tc.out), path)
-		} else {
-			assert.False(t, ok)
-		}
+		{"${a.b}", "V"},
+		{"$${a.b}", "$${a.b}"},
+		{"$${a.b} ${a.b}", "$${a.b} V"},
+		{"${a.b} $${a.b}", "V $${a.b}"},
+		{"${a.b}-${a.b}", "V-V"},
+		{"$${a.b} ${a.b} $${a.b}", "$${a.b} V $${a.b}"},
+		{"untouched ${c.d}", "untouched ${c.d}"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, ReplaceRef(tt.in, "${a.b}", "V"), "input %q", tt.in)
 	}
 }

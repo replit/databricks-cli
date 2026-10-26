@@ -26,6 +26,10 @@ func Initialize(ctx context.Context, b *bundle.Bundle) {
 	log.Info(ctx, "Phase: initialize")
 
 	bundle.ApplySeqContext(ctx, b,
+		// Reads (dynamic): resources.internal_immutable_snapshots (and other internal keys)
+		// Warns and removes any internal resource fields set by the user.
+		mutator.RejectInternalResources(),
+
 		// Reads (dynamic): resource.*.*
 		// Checks that none of resources.<type>.<key> is nil. Raises error otherwise.
 		validate.AllResourcesHaveValues(),
@@ -33,6 +37,7 @@ func Initialize(ctx context.Context, b *bundle.Bundle) {
 		validate.NoInterpolationInBundleName(),
 		validate.ValidateEngine(),
 		validate.Scripts(),
+		mutator.ValidateSecretValueIsVariable(),
 
 		// Updates (dynamic): sync.{paths,include,exclude} (makes them relative to bundle root rather than to definition file)
 		// Rewrites sync paths to be relative to the bundle root instead of the file they were defined in.
@@ -69,6 +74,12 @@ func Initialize(ctx context.Context, b *bundle.Bundle) {
 		// This mutator needs to be run before variable interpolation and defining default workspace paths
 		// because it affects how workspace variables are resolved.
 		mutator.ApplySourceLinkedDeploymentPreset(),
+
+		// Reads (env): __TEST_DATABRICKS_IMMUTABLE_FOLDER (non-empty value enables immutable folder mode)
+		// Updates (typed): b.Config.Experimental.ImmutableFolder (forces to true when env var is set)
+		// Allows running the full test suite against the immutable folder code path without
+		// modifying any databricks.yml files.
+		mutator.OverrideImmutableFolder(),
 
 		// Reads (typed): b.Config.Workspace.RootPath (checks if it's already set)
 		// Reads (typed): b.Config.Bundle.Name, b.Config.Bundle.Target (used to construct default path)
@@ -142,6 +153,34 @@ func Initialize(ctx context.Context, b *bundle.Bundle) {
 		// After PythonMutator, mutators must not change bundle resources, or such changes are not
 		// going to be visible in Python code.
 
+		// Warn when the deprecated pipeline-level development property is set by the user.
+		// Must run after PythonMutator to see development values set by Python mutators.
+		validate.PipelineDevelopmentDeprecated(),
+
+		// Compute resources.volumes.*.volume_path and resolve references to it. Must run after
+		// PythonMutator: volume_path is computed and read-only, not declared by the PyDABs Volume
+		// model, so exposing it to Python would fail resource loading (like "deployment" below).
+		mutator.InitializeVolumePaths(),
+		mutator.ResolveVolumePathReferencesOnlyResources(),
+
+		// Default the `source` field on job tasks (GIT for git_source jobs, else
+		// WORKSPACE). Runs after PythonMutator so it sees the final git_source/tasks
+		// and does not expose the injected default to Python code, while remaining
+		// visible in `bundle validate`/`summary`.
+		resourcemutator.ApplyDefaultTaskSource(),
+
+		// Drop empty-string values on omitempty resource fields so they are not
+		// force-sent to the backend. Runs after variable resolution (a variable may
+		// resolve to "") and after all resource mutations, before validation so that
+		// required fields (no omitempty) still error if empty.
+		mutator.DropEmptyStrings(),
+
+		// Resolve --select selectors against the materialized resources: normalize
+		// each to its "type.name" form and validate it exists. Runs after all resource
+		// mutations so that dynamically added resources are visible. This does not
+		// filter resources; the direct engine selects against the resolved keys later.
+		mutator.ResolveSelect(),
+
 		// Validate all required fields are set. This is run after variable interpolation and PyDABs mutators
 		// since they can also set and modify resources.
 		validate.Required(),
@@ -151,6 +190,24 @@ func Initialize(ctx context.Context, b *bundle.Bundle) {
 
 		// Validate that no dashboard etags are set. They are purely internal state and should not be set by the user.
 		validate.ValidateDashboardEtags(),
+
+		// Validate that no genie space etags are set. They are purely internal state and should not be set by the user.
+		validate.ValidateGenieSpaceEtags(),
+
+		// Validate that deployment_id / version_id are not set on jobs or pipelines.
+		// They are set by the CLI to track the bundle deployment and must not be set by the user.
+		validate.ValidateDeploymentFields(),
+
+		// Reject configured job_runs.idempotency_token; the CLI sets it on run-now.
+		validate.ValidateJobRunIdempotencyToken(),
+
+		// Reject invalid job_runs.lifecycle.triggers (empty, false, prevent_destroy).
+		mutator.ValidateJobRunTriggers(),
+
+		// Reads (dynamic): * (strings) (searches for ${resources.*} references)
+		// Errors when a cross-resource reference points to a Terraform-only field
+		// with no DABs equivalent.
+		validate.TFOnlyReferences(),
 
 		// Reads (typed): b.Config.Permissions (checks if current user or their groups have CAN_MANAGE permissions)
 		// Reads (typed): b.Config.Workspace.CurrentUser (gets current user information)

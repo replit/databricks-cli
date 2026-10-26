@@ -26,6 +26,10 @@ func New() *cobra.Command {
 		RunE:    root.ReportUnknownSubcommand,
 	}
 
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
 	// Add methods
 	cmd.AddCommand(newGetPublicWorkspaceSetting())
 	cmd.AddCommand(newListWorkspaceSettingsMetadata())
@@ -65,6 +69,8 @@ func newGetPublicWorkspaceSetting() *cobra.Command {
     NAME: Name of the setting`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -134,6 +140,8 @@ func newListWorkspaceSettingsMetadata() *cobra.Command {
   :method:settingsv2/patchpublicworkspacesetting APIs`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(0)
@@ -188,21 +196,29 @@ func newPatchPublicWorkspaceSetting() *cobra.Command {
 
 	// TODO: complex arg: aibi_dashboard_embedding_access_policy
 	// TODO: complex arg: aibi_dashboard_embedding_approved_domains
+	// TODO: complex arg: allowed_apps_user_api_scopes
 	// TODO: complex arg: automatic_cluster_update_workspace
 	// TODO: complex arg: boolean_val
+	// TODO: complex arg: collaboration_platform_connectivity
 	// TODO: complex arg: effective_aibi_dashboard_embedding_access_policy
 	// TODO: complex arg: effective_aibi_dashboard_embedding_approved_domains
+	// TODO: complex arg: effective_allowed_apps_user_api_scopes
 	// TODO: complex arg: effective_automatic_cluster_update_workspace
 	// TODO: complex arg: effective_boolean_val
+	// TODO: complex arg: effective_collaboration_platform_connectivity
 	// TODO: complex arg: effective_integer_val
+	// TODO: complex arg: effective_operational_email_custom_recipient
 	// TODO: complex arg: effective_personal_compute
 	// TODO: complex arg: effective_restrict_workspace_admins
 	// TODO: complex arg: effective_string_val
+	// TODO: complex arg: effective_workspace_label
 	// TODO: complex arg: integer_val
 	cmd.Flags().StringVar(&patchPublicWorkspaceSettingReq.Setting.Name, "name", patchPublicWorkspaceSettingReq.Setting.Name, `Name of the setting.`)
+	// TODO: complex arg: operational_email_custom_recipient
 	// TODO: complex arg: personal_compute
 	// TODO: complex arg: restrict_workspace_admins
 	// TODO: complex arg: string_val
+	// TODO: complex arg: workspace_label
 
 	cmd.Use = "patch-public-workspace-setting NAME"
 	cmd.Short = `Update a workspace setting.`
@@ -220,6 +236,8 @@ func newPatchPublicWorkspaceSetting() *cobra.Command {
     NAME: Name of the setting`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)

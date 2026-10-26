@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/databricks/cli/bundle/deployplan"
 	"github.com/databricks/cli/bundle/direct/dresources"
@@ -35,6 +36,11 @@ type DeploymentUnit struct {
 
 	// DependsOn lists resources this resource depends on (persisted in state).
 	DependsOn []deployplan.DependsOnEntry
+
+	// MaxWait caps how long to wait for this resource to reach its target state. Must be set
+	// to maxWaitUnset to fall back to the resource's own timeout: the zero value is a valid
+	// cap meaning "do not wait at all". See resourceMaxWait and unitMaxWait.
+	MaxWait time.Duration
 }
 
 // DeploymentBundle holds everything needed to deploy a bundle
@@ -64,7 +70,9 @@ func (d *DeploymentUnit) SetRemoteState(remoteState any) error {
 	return nil
 }
 
+// ExportState exports the current deployment state as a resource map.
+// StateDB must already be open for read before calling this function.
 func (b *DeploymentBundle) ExportState(ctx context.Context) resourcestate.ExportedResourcesMap {
-	b.StateDB.AssertOpened()
+	b.StateDB.AssertOpenedForRead()
 	return b.StateDB.ExportState(ctx)
 }

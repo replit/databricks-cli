@@ -6,6 +6,11 @@ Download https://github.com/databricks/cli/blob/ciconfig/known_failures.txt in p
 If download was successful by the time test runner finishes and test runner finishes with non-zero code,
 analyze failures in the test output identified by --jsonfile option. If all failures are expected (listed in known_failures.txt)
 then the failure is masked, the process exits with 0.
+
+A parent test fails whenever one of its subtests fails, so a rule that lists a
+subtest also allows the parent to fail. That allowance only applies when a
+subtest actually failed; if the parent failed on its own (e.g. in setup, before
+any subtest ran), its failure is reported as unexpected.
 */
 package main
 
@@ -13,11 +18,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -39,7 +46,7 @@ func getExitCode(err error) (int, error) {
 	if err == nil {
 		return 0, nil
 	}
-	if exitError, ok := err.(*exec.ExitError); ok {
+	if exitError, ok := errors.AsType[*exec.ExitError](err); ok {
 		if status, ok := exitError.Sys().(syscall.WaitStatus); ok {
 			return status.ExitStatus(), nil
 		}
@@ -158,6 +165,7 @@ func checkFailures(config *Config, jsonFile string, originalExitCode int) int {
 	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
+	failed := map[string]bool{}
 	unexpectedFailures := map[string]bool{}
 
 	for scanner.Scan() {
@@ -177,21 +185,33 @@ func checkFailures(config *Config, jsonFile string, originalExitCode int) int {
 		}
 
 		result.Package, _ = strings.CutPrefix(result.Package, cutPrefix)
-
 		key := result.Package + " " + result.Test
 
-		if result.Action == "fail" {
+		switch result.Action {
+		case "fail":
+			// Go reports a parent's failure only after its subtests, so any
+			// failing subtest is already in `failed` by the time we get here.
+			failed[key] = true
 			matchedRule := config.matches(result.Package, result.Test)
-			if matchedRule != "" {
+			switch {
+			case matchedRule != "":
 				fmt.Printf("%s %s failure is allowed, matches rule %q\n", result.Package, result.Test, matchedRule)
-			} else {
+			case hasFailedSubtest(failed, key):
+				// A parent test fails when a subtest fails; the subtest is
+				// reported on its own, so the parent's failure is not counted.
+				fmt.Printf("%s %s failure is allowed, a subtest failed\n", result.Package, result.Test)
+			default:
 				fmt.Printf("%s %s failure is not allowed\n", result.Package, result.Test)
 				unexpectedFailures[key] = true
 			}
-		} else if result.Action == "pass" && unexpectedFailures[key] {
-			fmt.Printf("%s %s passed on retry\n", result.Package, result.Test)
-			// We run gotestsum with --rerun-fails, so we need to account for intermittent failures
-			delete(unexpectedFailures, key)
+		case "pass":
+			// We run gotestsum with --rerun-fails, so a test that fails and
+			// later passes is flaky, not a failure.
+			delete(failed, key)
+			if unexpectedFailures[key] {
+				fmt.Printf("%s %s passed on retry\n", result.Package, result.Test)
+				delete(unexpectedFailures, key)
+			}
 		}
 	}
 
@@ -207,6 +227,18 @@ func checkFailures(config *Config, jsonFile string, originalExitCode int) int {
 	return originalExitCode
 }
 
+// hasFailedSubtest reports whether any failing test is a strict subtest of key.
+// Keys are "<package> <test>", so a subtest's key is prefixed by key + "/".
+func hasFailedSubtest(failed map[string]bool, key string) bool {
+	prefix := key + "/"
+	for k := range failed {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // CI Config Format
 //
 // The CI config is downloaded from the "ciconfig" branch of the repository.
@@ -217,13 +249,18 @@ func checkFailures(config *Config, jsonFile string, originalExitCode int) int {
 // Where:
 // - Lines with whitespace only are ignored
 // - Everything after '#' is a comment and is ignored
-// - Both package and testcase can be '*' meaning any package or any testcase
-// - Both can end with '/' which means it's a prefix match
+// - Both package and testcase are matched segment by segment, split on '/'
+// - A '*' segment matches any number of segments (including zero), so a whole
+//   field of '*' matches anything and an interior '*' spans the segments
+//   between two fixed ones
+// - A trailing '/' makes the pattern a prefix: it matches the listed segments
+//   plus any number of segments below them
 //
 // Examples:
-//   "libs/ *"           - all packages starting with "libs/" and all testcases are allowed to fail
-//   "* TestAccept/"     - all testcases starting with "TestAccept/" are allowed to fail
-//   "bundle TestDeploy" - exact match for package "bundle" and testcase "TestDeploy"
+//   "libs/ *"                  - all packages under "libs/" and all testcases are allowed to fail
+//   "* TestAccept/"            - all testcases under "TestAccept/" are allowed to fail
+//   "bundle TestDeploy"        - exact match for package "bundle" and testcase "TestDeploy"
+//   "* TestAccept/*/DMS=true/" - every testcase with a "DMS=true" segment, at any depth
 //
 // Parse errors for individual lines are logged but do not abort processing.
 
@@ -232,8 +269,10 @@ type Config struct {
 }
 
 func (c *Config) matches(packageName, testName string) string {
+	pkg := strings.Split(packageName, "/")
+	test := strings.Split(testName, "/")
 	for _, rule := range c.rules {
-		if rule.matches(packageName, testName) {
+		if rule.matches(pkg, test) {
 			return rule.OriginalLine
 		}
 	}
@@ -241,10 +280,8 @@ func (c *Config) matches(packageName, testName string) string {
 }
 
 type ConfigRule struct {
-	PackagePattern string
-	TestPattern    string
-	PackagePrefix  bool
-	TestPrefix     bool
+	PackagePattern []string
+	TestPattern    []string
 	OriginalLine   string
 }
 
@@ -283,12 +320,21 @@ func parseConfig(content string) (*Config, error) {
 	return config, scanner.Err()
 }
 
-// parsePattern returns the pattern and whether it's a prefix match.
-func parsePattern(pattern string) (string, bool) {
-	if pattern == "*" {
-		return "", true
+// parsePattern splits a pattern field into segments. A trailing "/" marks a
+// prefix match, represented as a trailing "*" segment so it matches any number
+// of segments below the listed ones. An empty segment (from "//" or a bare "/")
+// can never match a real path segment, so it is rejected rather than silently
+// producing a rule that matches nothing.
+func parsePattern(pattern string) ([]string, error) {
+	prefix := strings.HasSuffix(pattern, "/")
+	segments := strings.Split(strings.TrimSuffix(pattern, "/"), "/")
+	if slices.Contains(segments, "") {
+		return nil, fmt.Errorf("empty segment in pattern %q", pattern)
 	}
-	return strings.CutSuffix(pattern, "/")
+	if prefix {
+		segments = append(segments, "*")
+	}
+	return segments, nil
 }
 
 func parseConfigRule(line, originalLine string) (ConfigRule, error) {
@@ -297,50 +343,53 @@ func parseConfigRule(line, originalLine string) (ConfigRule, error) {
 		return ConfigRule{}, fmt.Errorf("expected 2 fields, got %d", len(parts))
 	}
 
-	packagePattern := parts[0]
-	testPattern := parts[1]
+	packagePattern, err := parsePattern(parts[0])
+	if err != nil {
+		return ConfigRule{}, err
+	}
+	testPattern, err := parsePattern(parts[1])
+	if err != nil {
+		return ConfigRule{}, err
+	}
 
-	rule := ConfigRule{
+	return ConfigRule{
 		PackagePattern: packagePattern,
 		TestPattern:    testPattern,
 		OriginalLine:   strings.TrimSpace(originalLine),
-	}
-
-	// Check for wildcard or prefix
-	rule.PackagePattern, rule.PackagePrefix = parsePattern(packagePattern)
-	rule.TestPattern, rule.TestPrefix = parsePattern(testPattern)
-
-	return rule, nil
+	}, nil
 }
 
-func (r ConfigRule) matches(packageName, testName string) bool {
-	// Check package pattern
-	var packageMatch bool
-	if r.PackagePrefix {
-		packageMatch = matchesPathPrefix(packageName, r.PackagePattern)
-	} else {
-		packageMatch = packageName == r.PackagePattern
-	}
-
-	if !packageMatch {
-		return false
-	}
-
-	// Check test pattern
-	if r.TestPrefix {
-		return matchesPathPrefix(testName, r.TestPattern) || matchesPathPrefix(r.TestPattern, testName)
-	}
-	return testName == r.TestPattern || matchesPathPrefix(r.TestPattern, testName)
+func (r ConfigRule) matches(packageName, testName []string) bool {
+	return matchSegments(r.PackagePattern, packageName) &&
+		matchSegments(r.TestPattern, testName)
 }
 
-// matchesPathPrefix returns true if s matches pattern or starts with pattern + "/"
-// If pattern is empty (wildcard "*"), it matches any string
-func matchesPathPrefix(s, prefix string) bool {
-	if prefix == "" {
-		return true
+// matchSegments reports whether name matches pattern segment by segment, where
+// a "*" pattern segment matches any number of name segments (including zero).
+// It is the standard linear wildcard match that backtracks on the latest "*".
+func matchSegments(pattern, name []string) bool {
+	pi, ni := 0, 0
+	star, match := -1, 0
+	for ni < len(name) {
+		switch {
+		case pi < len(pattern) && pattern[pi] == "*":
+			star = pi
+			match = ni
+			pi++
+		case pi < len(pattern) && pattern[pi] == name[ni]:
+			pi++
+			ni++
+		case star >= 0:
+			// Backtrack: let the last "*" consume one more name segment.
+			pi = star + 1
+			match++
+			ni = match
+		default:
+			return false
+		}
 	}
-	if s == prefix {
-		return true
+	for pi < len(pattern) && pattern[pi] == "*" {
+		pi++
 	}
-	return strings.HasPrefix(s, prefix+"/")
+	return pi == len(pattern)
 }

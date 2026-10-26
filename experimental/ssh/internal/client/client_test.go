@@ -94,6 +94,116 @@ func TestValidate(t *testing.T) {
 			name: "valid environment version",
 			opts: client.ClientOptions{ClusterID: "abc-123", EnvironmentVersion: 4},
 		},
+		{
+			name:    "base environment with environment version",
+			opts:    client.ClientOptions{ConnectionName: "my-conn", BaseEnvironment: "my-env", EnvironmentVersion: 4},
+			wantErr: "--base-environment cannot be used together with --environment-version",
+		},
+		{
+			name:    "base environment with cluster",
+			opts:    client.ClientOptions{ClusterID: "abc-123", BaseEnvironment: "my-env"},
+			wantErr: "--base-environment can only be used with serverless compute",
+		},
+		{
+			name: "valid base environment with connection name",
+			opts: client.ClientOptions{ConnectionName: "my-conn", BaseEnvironment: "/Workspace/path/to/env.yaml"},
+		},
+		{
+			name: "base environment with serverless GPU accelerator",
+			opts: client.ClientOptions{ConnectionName: "my-conn", Accelerator: "GPU_1xA10", BaseEnvironment: "my-gpu-env"},
+		},
+		{
+			name:    "usage policy with cluster ID",
+			opts:    client.ClientOptions{ClusterID: "abc-123", UsagePolicyID: "pol-1"},
+			wantErr: "--usage-policy-id flag can only be used with serverless compute (--name flag)",
+		},
+		{
+			name: "usage policy with connection name",
+			opts: client.ClientOptions{ConnectionName: "my-conn", UsagePolicyID: "pol-1"},
+		},
+		{
+			name: "keep detached processes with serverless",
+			opts: client.ClientOptions{ConnectionName: "my-conn", KeepDetachedProcesses: true},
+		},
+		{
+			name: "keep detached processes with cluster ID",
+			opts: client.ClientOptions{ClusterID: "abc-123", KeepDetachedProcesses: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := tt.opts
+			// Validate range-checks MaxClients and ServerTimeout, which the commands always
+			// supply from a flag default. Set them for every case here so the cases above,
+			// which are about unrelated fields, aren't rejected by those checks;
+			// TestValidateServerLifecycle covers them directly.
+			opts.MaxClients = 10
+			opts.ServerTimeout = 24 * time.Hour
+			err := opts.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateServerLifecycle(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    client.ClientOptions
+		wantErr string
+	}{
+		{
+			name: "defaults",
+			opts: client.ClientOptions{ClusterID: "abc-123", MaxClients: 10, ShutdownDelay: 10 * time.Minute, ServerTimeout: 24 * time.Hour},
+		},
+		{
+			name: "single client slot",
+			opts: client.ClientOptions{ClusterID: "abc-123", MaxClients: 1, ServerTimeout: time.Hour},
+		},
+		{
+			name:    "zero max clients",
+			opts:    client.ClientOptions{ClusterID: "abc-123", MaxClients: 0, ServerTimeout: time.Hour},
+			wantErr: "--max-clients must be at least 1, got 0",
+		},
+		{
+			name:    "negative max clients",
+			opts:    client.ClientOptions{ClusterID: "abc-123", MaxClients: -1, ServerTimeout: time.Hour},
+			wantErr: "--max-clients must be at least 1, got -1",
+		},
+		{
+			name:    "zero server timeout",
+			opts:    client.ClientOptions{ClusterID: "abc-123", MaxClients: 10},
+			wantErr: "--server-timeout must be at least 1s, got 0s",
+		},
+		{
+			name:    "negative server timeout",
+			opts:    client.ClientOptions{ClusterID: "abc-123", MaxClients: 10, ServerTimeout: -time.Minute},
+			wantErr: "--server-timeout must be at least 1s, got -1m0s",
+		},
+		{
+			// Anything under a second truncates to timeout_seconds: 0, which the Jobs API reads
+			// as "no timeout" - the opposite of the short lifetime this asks for.
+			name:    "sub-second server timeout",
+			opts:    client.ClientOptions{ClusterID: "abc-123", MaxClients: 10, ServerTimeout: 999 * time.Millisecond},
+			wantErr: "--server-timeout must be at least 1s, got 999ms",
+		},
+		{
+			name: "one second server timeout",
+			opts: client.ClientOptions{ClusterID: "abc-123", MaxClients: 10, ServerTimeout: time.Second},
+		},
+		{
+			name:    "shutdown delay longer than server timeout",
+			opts:    client.ClientOptions{ClusterID: "abc-123", MaxClients: 10, ShutdownDelay: 48 * time.Hour, ServerTimeout: 24 * time.Hour},
+			wantErr: "--shutdown-delay (48h0m0s) cannot be longer than --server-timeout (24h0m0s)",
+		},
+		{
+			name: "shutdown delay equal to server timeout",
+			opts: client.ClientOptions{ClusterID: "abc-123", MaxClients: 10, ShutdownDelay: time.Hour, ServerTimeout: time.Hour},
+		},
 	}
 
 	for _, tt := range tests {
@@ -146,10 +256,23 @@ func TestGenerateDefaultConnectionName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := client.GenerateDefaultConnectionName(tt.host, tt.accelerator)
+			got := client.GenerateDefaultConnectionName(tt.host, tt.accelerator, "")
 			assert.Equal(t, tt.want, got)
 		})
 	}
+
+	// A serverless server bakes in its base environment, so distinct environments
+	// must map to distinct default names (otherwise --base-environment is silently
+	// ignored when an existing server for the default name is reused).
+	t.Run("base environment differentiates the name", func(t *testing.T) {
+		const host = "https://my-workspace.cloud.databricks.com"
+		base := client.GenerateDefaultConnectionName(host, "", "")
+		withEnv := client.GenerateDefaultConnectionName(host, "", "my-env")
+		otherEnv := client.GenerateDefaultConnectionName(host, "", "other-env")
+		assert.NotEqual(t, base, withEnv, "setting --base-environment must change the default name")
+		assert.NotEqual(t, withEnv, otherEnv, "different environments must produce different names")
+		assert.Equal(t, withEnv, client.GenerateDefaultConnectionName(host, "", "my-env"), "must be deterministic")
+	})
 }
 
 func TestGenerateDefaultConnectionNameMatchesRegex(t *testing.T) {
@@ -159,12 +282,15 @@ func TestGenerateDefaultConnectionNameMatchesRegex(t *testing.T) {
 		"https://workspace3.gcp.databricks.com",
 	}
 	accelerators := []string{"", "GPU_1xA10", "GPU_8xH100"}
+	environments := []string{"", "my-env", "/Workspace/Users/me@example.com/env.yaml"}
 	nameRegex := regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
 	for _, host := range hosts {
 		for _, acc := range accelerators {
-			name := client.GenerateDefaultConnectionName(host, acc)
-			assert.Regexp(t, nameRegex, name, "host=%q accelerator=%q name=%q", host, acc, name)
+			for _, env := range environments {
+				name := client.GenerateDefaultConnectionName(host, acc, env)
+				assert.Regexp(t, nameRegex, name, "host=%q accelerator=%q environment=%q name=%q", host, acc, env, name)
+			}
 		}
 	}
 }
@@ -200,6 +326,35 @@ func TestToProxyCommand(t *testing.T) {
 			want: quoted + " ssh connect --proxy --name=my-conn --shutdown-delay=2m0s --accelerator=GPU_1xA10",
 		},
 		{
+			name: "serverless with usage policy",
+			opts: client.ClientOptions{ConnectionName: "my-conn", UsagePolicyID: "pol-1", ShutdownDelay: 2 * time.Minute},
+			want: quoted + " ssh connect --proxy --name=my-conn --shutdown-delay=2m0s --usage-policy-id=pol-1",
+		},
+		{
+			// Both are fixed at server submission, so a host configured by `ssh setup` can only
+			// carry them through the ProxyCommand.
+			name: "with server lifecycle flags",
+			opts: client.ClientOptions{ClusterID: "abc-123", ShutdownDelay: 5 * time.Minute, MaxClients: 25, ServerTimeout: 48 * time.Hour},
+			want: quoted + " ssh connect --proxy --cluster=abc-123 --auto-start-cluster=false --shutdown-delay=5m0s --max-clients=25 --server-timeout=48h0m0s",
+		},
+		{
+			name: "serverless with server lifecycle flags",
+			opts: client.ClientOptions{ConnectionName: "my-conn", ShutdownDelay: 2 * time.Minute, MaxClients: 25, ServerTimeout: 48 * time.Hour},
+			want: quoted + " ssh connect --proxy --name=my-conn --shutdown-delay=2m0s --max-clients=25 --server-timeout=48h0m0s",
+		},
+		{
+			// Carried into the ProxyCommand so a reconnect through ssh asks for the same
+			// mode, instead of starting a server that would sweep the detached work.
+			name: "dedicated cluster keeping detached processes",
+			opts: client.ClientOptions{ClusterID: "abc-123", KeepDetachedProcesses: true, ShutdownDelay: 5 * time.Minute},
+			want: quoted + " ssh connect --proxy --cluster=abc-123 --auto-start-cluster=false --shutdown-delay=5m0s --keep-detached-processes",
+		},
+		{
+			name: "serverless keeping detached processes",
+			opts: client.ClientOptions{ConnectionName: "my-conn", KeepDetachedProcesses: true, ShutdownDelay: 5 * time.Minute},
+			want: quoted + " ssh connect --proxy --name=my-conn --shutdown-delay=5m0s --keep-detached-processes",
+		},
+		{
 			name: "with metadata",
 			opts: client.ClientOptions{ClusterID: "abc-123", ServerMetadata: "user,2222,abc-123"},
 			want: quoted + " ssh connect --proxy --cluster=abc-123 --auto-start-cluster=false --shutdown-delay=0s --metadata=user,2222,abc-123",
@@ -223,6 +378,19 @@ func TestToProxyCommand(t *testing.T) {
 			name: "with environment version",
 			opts: client.ClientOptions{ClusterID: "abc-123", EnvironmentVersion: 4},
 			want: quoted + " ssh connect --proxy --cluster=abc-123 --auto-start-cluster=false --shutdown-delay=0s --environment-version=4",
+		},
+		{
+			name: "serverless with base environment",
+			opts: client.ClientOptions{ConnectionName: "my-conn", BaseEnvironment: "my env", ShutdownDelay: 2 * time.Minute},
+			want: quoted + ` ssh connect --proxy --name=my-conn --shutdown-delay=2m0s --base-environment='my env'`,
+		},
+		{
+			// The proxy command is executed via the shell, so a base environment
+			// containing shell metacharacters must be single-quoted (and embedded
+			// single quotes escaped) so nothing is expanded or word-split.
+			name: "serverless with base environment containing shell metacharacters",
+			opts: client.ClientOptions{ConnectionName: "my-conn", BaseEnvironment: `$(touch pwned) '; rm -rf /`, ShutdownDelay: 2 * time.Minute},
+			want: quoted + ` ssh connect --proxy --name=my-conn --shutdown-delay=2m0s --base-environment='$(touch pwned) '\''; rm -rf /'`,
 		},
 	}
 

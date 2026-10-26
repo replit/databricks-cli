@@ -7,10 +7,11 @@ Free standing arguments are substrings matching path.
 If argument starts with ! then it's a negation filter.
 
 Examples:
-  print_requests.py //jobs                     # Show non-GET requests with /jobs in path
-  print_requests.py --get //jobs               # Show all requests with /jobs in path
-  print_requests.py --sort '^//import-file/'   # Show non-GET requests, exclude /import-file/, sort output
-  print_requests.py --keep //jobs              # Show requests and do not delete out.requests.json afterwards
+  print_requests.py //jobs                              # Show non-GET requests with /jobs in path
+  print_requests.py --get //jobs                        # Show all requests with /jobs in path
+  print_requests.py --sort '^//import-file/'            # Show non-GET requests, exclude /import-file/, sort output
+  print_requests.py --keep //jobs                       # Show requests and do not delete out.requests.json afterwards
+  print_requests.py //api/2.0/repos/snapshots --method DELETE  # Show only DELETE to that path
 
 This replaces custom jq wrappers like:
   jq --sort-keys 'select(.method != "GET" and (.path | contains("/jobs")))' < out.requests.txt
@@ -56,20 +57,47 @@ R4 POST
 >>> # Test positive + negative filters (AND logic)
 >>> test(test_requests, ["//api", "^/jobs"], False, False)
 R4 POST
+
+>>> # --unique collapses consecutive duplicate requests (like uniq), e.g. repeated GET polls
+>>> dup_requests = [
+...     {"method": "POST", "path": "/api/2.0/idx", "body": {"n": 1}},
+...     {"method": "GET", "path": "/api/2.0/idx"},
+...     {"method": "GET", "path": "/api/2.0/idx"},
+... ]
+>>> [x["method"] for x in filter_requests(dup_requests, ["//idx"], True, False, unique=True)]
+['POST', 'GET']
+
+>>> # Only consecutive duplicates collapse; a repeat after another request is kept
+>>> seq = [
+...     {"method": "GET", "path": "/api/2.0/idx"},
+...     {"method": "DELETE", "path": "/api/2.0/idx"},
+...     {"method": "GET", "path": "/api/2.0/idx"},
+...     {"method": "GET", "path": "/api/2.0/idx"},
+... ]
+>>> [x["method"] for x in filter_requests(seq, ["//idx"], True, False, unique=True)]
+['GET', 'DELETE', 'GET']
 """
 
+import argparse
+import json
 import os
 import sys
-import json
-import argparse
 from pathlib import Path
-
 
 # I've originally tried ADD_PREFIX to be empty, so you can just do "print_requests.py /jobs"
 # However, that causes test to fail on Windows CI because "/jobs" becomes "C:/Program Files/Git/jobs"
 # This behaviour can be disabled with MSYS_NO_PATHCONV=1 but that causes other failures, so we require extra slash here.
 ADD_PREFIX = "/"
 NEGATE_PREFIX = "^/"
+
+# What --nostamp deletes. A job create sends the deployment block at the top level, an
+# update nests it under new_settings.
+STAMP_FIELDS = [
+    "deployment.deployment_id",
+    "deployment.version_id",
+    "new_settings.deployment.deployment_id",
+    "new_settings.deployment.version_id",
+]
 
 
 def read_json_many(s):
@@ -104,7 +132,13 @@ result = read_json_many(test)
 assert result == [{"method": "GET"}, {"method": "POST"}], result
 
 
-def filter_requests(requests, path_filters, include_get, should_sort):
+# DMS_PATH is the deployment metadata service's prefix; see filter_requests.
+DMS_PATH = "/api/2.0/bundle"
+
+
+def filter_requests(
+    requests, path_filters, include_get, should_sort, unique=False, method_filter=None, include_dms=False
+):
     """Filter requests based on method and path filters."""
     positive_filters = []
     negative_filters = []
@@ -117,10 +151,21 @@ def filter_requests(requests, path_filters, include_get, should_sort):
         else:
             sys.exit(f"Unrecognized filter: {f!r}")
 
+    # Deployment-history requests carry the resource key in the path
+    # (.../operations/jobs.foo), so a filter like //jobs matches them too and every test
+    # that records one resource type would pick these up in the recording run. Excluded
+    # unless --dms asks for them.
+    if not include_dms:
+        negative_filters.append(DMS_PATH)
+
     filtered_requests = []
     for req in requests:
-        # Skip GET requests unless include_get is True
-        if req.get("method") == "GET" and not include_get:
+        if method_filter:
+            # --method overrides the default GET exclusion
+            if req.get("method") != method_filter:
+                continue
+        elif req.get("method") == "GET" and not include_get:
+            # Skip GET requests unless include_get is True
             continue
 
         # Apply path filters
@@ -145,28 +190,107 @@ def filter_requests(requests, path_filters, include_get, should_sort):
     if should_sort:
         filtered_requests.sort(key=str)
 
+    if unique:
+        deduped = []
+        for req in filtered_requests:
+            if not deduped or deduped[-1] != req:
+                deduped.append(req)
+        filtered_requests = deduped
+
     return filtered_requests
+
+
+def summary_line(req):
+    """Format a request as "METHOD path key=value ...", query keys sorted.
+
+    >>> summary_line({"method": "GET", "path": "/api/2.0/workspace/get-status", "q": {"path": "/a", "return_export_info": "true"}})
+    'GET /api/2.0/workspace/get-status path=/a return_export_info=true'
+    >>> summary_line({"method": "POST", "path": "/api/2.1/jobs/create", "body": {"name": "x"}})
+    'POST /api/2.1/jobs/create'
+    """
+    parts = [req.get("method", ""), req.get("path", "")]
+    parts += [f"{k}={v}" for k, v in sorted(req.get("q", {}).items())]
+    return " ".join(parts)
+
+
+def del_path(body, field):
+    """Delete field from body. A dotted field descends into nested objects, e.g.
+    deployment.version_id removes only that key from the deployment block."""
+    *parents, leaf = field.split(".")
+    for name in parents:
+        body = body.get(name)
+        if not isinstance(body, dict):
+            return
+    body.pop(leaf, None)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("path_filters", nargs="*", help=f"Path substring filters")
+    parser.add_argument("path_filters", nargs="*", help="Path substring filters")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable diagnostic messages")
     parser.add_argument("--get", action="store_true", help="Include GET requests (excluded by default)")
+    parser.add_argument(
+        "--dms",
+        action="store_true",
+        help="Include deployment-history requests (excluded by default; see filter_requests)",
+    )
     parser.add_argument("--keep", action="store_true", help="Keep out.requests.json file after processing")
     parser.add_argument("--sort", action="store_true", help="Sort requests before output")
+    parser.add_argument(
+        "--unique",
+        action="store_true",
+        help="Collapse consecutive duplicate requests (like uniq), e.g. repeated GET polls",
+    )
+    parser.add_argument("--method", metavar="METHOD", help="Only show requests with this HTTP method (e.g. DELETE)")
     parser.add_argument("--oneline", action="store_true", help="Print output with one request per line")
-    parser.add_argument("--fname", default="out.requests.txt")
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print only method, path and query of each request, one per line, so a test can "
+        "assert which calls a command makes without their bodies.",
+    )
+    parser.add_argument(
+        "--del-body",
+        action="append",
+        default=[],
+        metavar="FIELDS",
+        help="Comma-separated body fields to delete from each request (repeatable). Use for "
+        "body fields that diverge between deployment engines, e.g. identity fields the "
+        "terraform provider serializes into the body but the direct engine sends as query params.",
+    )
+    parser.add_argument(
+        "--del-field",
+        action="append",
+        default=[],
+        metavar="FIELDS",
+        help="Comma-separated top-level request fields to delete (repeatable). Unlike "
+        "--del-body, which edits the parsed JSON body, this drops a field of the request "
+        "record itself, e.g. raw_body for a binary upload payload.",
+    )
+    parser.add_argument(
+        "--nostamp",
+        action="store_true",
+        help="Drop the deployment stamp (deployment_id, version_id) from job and pipeline "
+        "bodies, so a test asserts the same requests whether or not deployment history "
+        "recording is on. Shorthand for the --del-body fields it implies.",
+    )
+    parser.add_argument("--fname", default=os.environ["OUT_REQUESTS"])
     args = parser.parse_args()
 
+    del_body_fields = [field for group in args.del_body for field in group.split(",")]
+    if args.nostamp:
+        del_body_fields += STAMP_FIELDS
+    del_fields = [field for group in args.del_field for field in group.split(",")]
+
+    fname = Path(args.fname)
     test_tmp_dir = os.environ.get("TEST_TMP_DIR")
-    if test_tmp_dir:
-        requests_file = Path(test_tmp_dir) / args.fname
+    if test_tmp_dir and not fname.is_absolute():
+        requests_file = Path(test_tmp_dir) / fname
     else:
-        requests_file = Path(args.fname)
+        requests_file = fname
 
     if not requests_file.exists():
-        sys.exit(f"File {requests_file} not found")
+        sys.exit(f"File {requests_file.as_posix()} not found")
 
     with open(requests_file) as fobj:
         data = fobj.read()
@@ -175,13 +299,33 @@ def main():
         return
 
     requests = read_json_many(data)
-    filtered_requests = filter_requests(requests, args.path_filters, args.get, args.sort)
+    filtered_requests = filter_requests(
+        requests, args.path_filters, args.get, args.sort, args.unique, args.method, args.dms
+    )
+
+    for req in filtered_requests:
+        body = req.get("body")
+        if isinstance(body, dict):
+            for field in del_body_fields:
+                del_path(body, field)
+        for field in del_fields:
+            req.pop(field, None)
     if args.verbose:
         print(
             f"Read {len(data)} chars, {len(requests)} requests, {len(filtered_requests)} after filtering",
             file=sys.stderr,
             flush=True,
         )
+
+    if args.summary:
+        lines = [summary_line(req) for req in filtered_requests]
+        # Sorted after formatting: concurrent requests are recorded in arrival order, and the
+        # summary drops the fields --sort would otherwise break ties on.
+        if args.sort:
+            lines.sort()
+        for line in lines:
+            print(line)
+        filtered_requests = []
 
     for req in filtered_requests:
         if args.oneline:

@@ -16,6 +16,7 @@ import (
 
 	"github.com/databricks/cli/bundle"
 	"github.com/databricks/cli/bundle/config"
+	"github.com/databricks/cli/bundle/config/resources"
 	"github.com/databricks/cli/libs/diag"
 	"github.com/databricks/cli/libs/dyn"
 	"github.com/databricks/cli/libs/notebook"
@@ -196,8 +197,7 @@ func (t *translateContext) rewritePath(
 
 func (t *translateContext) translateNotebookPath(ctx context.Context, literal, localFullPath, localRelPath string) (string, error) {
 	if t.skipLocalFileValidation {
-		localRelPathNoExt := strings.TrimSuffix(localRelPath, path.Ext(localRelPath))
-		return path.Join(t.remoteRoot, localRelPathNoExt), nil
+		return path.Join(t.remoteRoot, notebook.StripExtension(localRelPath)), nil
 	}
 
 	nb, _, err := notebook.DetectWithFS(t.b.SyncRoot, localRelPath)
@@ -229,9 +229,9 @@ to contain one of the following file extensions: [%s]`, literal, strings.Join(no
 		return "", ErrIsNotNotebook{localFullPath}
 	}
 
-	// Upon import, notebooks are stripped of their extension.
-	localRelPathNoExt := strings.TrimSuffix(localRelPath, path.Ext(localRelPath))
-	return path.Join(t.remoteRoot, localRelPathNoExt), nil
+	// Upon import, notebooks are stripped of their extension. Designer files
+	// keep their full ".designer.ipynb" suffix.
+	return path.Join(t.remoteRoot, notebook.StripExtension(localRelPath)), nil
 }
 
 func (t *translateContext) translateFilePath(ctx context.Context, literal, localFullPath, localRelPath string) (string, error) {
@@ -303,10 +303,10 @@ func (t *translateContext) translateLocalRelativeWithPrefixPath(ctx context.Cont
 func (t *translateContext) rewriteValue(ctx context.Context, p dyn.Path, v dyn.Value, dir string, opts translateOptions) (dyn.Value, error) {
 	out, err := t.rewritePath(ctx, dir, v.MustString(), opts)
 	if err != nil {
-		if target := (&ErrIsNotebook{}); errors.As(err, target) {
+		if target, ok := errors.AsType[ErrIsNotebook](err); ok {
 			return dyn.InvalidValue, fmt.Errorf(`expected a file for "%s" but got a notebook: %w`, p, target)
 		}
-		if target := (&ErrIsNotNotebook{}); errors.As(err, target) {
+		if target, ok := errors.AsType[ErrIsNotNotebook](err); ok {
 			return dyn.InvalidValue, fmt.Errorf(`expected a notebook for "%s" but got a file: %w`, p, target)
 		}
 		return dyn.InvalidValue, err
@@ -321,11 +321,22 @@ func (t *translateContext) rewriteValue(ctx context.Context, p dyn.Path, v dyn.V
 }
 
 func applyTranslations(ctx context.Context, b *bundle.Bundle, t *translateContext, translations []func(context.Context, dyn.Value) (dyn.Value, error)) diag.Diagnostics {
-	// Set the remote root to the sync root if source-linked deployment is enabled.
-	// Otherwise, set it to the workspace file path.
-	if config.IsExplicitlyEnabled(t.b.Config.Presets.SourceLinkedDeployment) {
+	switch {
+	case b.IsImmutableFolder():
+		// Reject an explicit workspace.file_path: immutable bundles set it
+		// automatically to the content-addressed snapshot location. A user-supplied
+		// value would be silently discarded during path translation, so we error early.
+		if loc := b.Config.GetLocation("workspace.file_path"); loc.File != "" {
+			return diag.Diagnostics{{
+				Severity:  diag.Error,
+				Summary:   "workspace.file_path cannot be configured when experimental.immutable_folder is enabled",
+				Locations: []diag.Location{loc},
+			}}
+		}
+		t.remoteRoot = resources.SnapshotFullPathRef + "/files"
+	case config.IsExplicitlyEnabled(t.b.Config.Presets.SourceLinkedDeployment):
 		t.remoteRoot = t.b.SyncRootPath
-	} else {
+	default:
 		t.remoteRoot = t.b.Config.Workspace.FilePath
 	}
 
@@ -369,35 +380,6 @@ func (m *translatePathsDashboards) Apply(ctx context.Context, b *bundle.Bundle) 
 
 	return applyTranslations(ctx, b, t, []func(context.Context, dyn.Value) (dyn.Value, error){
 		t.applyDashboardTranslations,
+		t.applyGenieSpaceTranslations,
 	})
-}
-
-// gatherFallbackPaths collects the fallback paths for relative paths in the configuration.
-// Read more about the motivation for this functionality in the "fallback" path translation tests.
-func gatherFallbackPaths(v dyn.Value, typ string) (map[string]string, error) {
-	fallback := make(map[string]string)
-	pattern := dyn.NewPattern(dyn.Key("resources"), dyn.Key(typ), dyn.AnyKey())
-
-	// Previous behavior was to use a resource's location as the base path to resolve
-	// relative paths in its definition. With the introduction of [dyn.Value] throughout,
-	// we can use the location of the [dyn.Value] of the relative path itself.
-	//
-	// This is more flexible, as resources may have overrides that are not
-	// located in the same directory as the resource configuration file.
-	//
-	// To maintain backwards compatibility, we allow relative paths to be resolved using
-	// the original approach as fallback if the [dyn.Value] location cannot be resolved.
-	_, err := dyn.MapByPattern(v, pattern, func(p dyn.Path, v dyn.Value) (dyn.Value, error) {
-		key := p[2].Key()
-		dir, err := locationDirectory(v.Location())
-		if err != nil {
-			return dyn.InvalidValue, fmt.Errorf("unable to determine directory for %s: %w", p, err)
-		}
-		fallback[key] = dir
-		return v, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return fallback, nil
 }

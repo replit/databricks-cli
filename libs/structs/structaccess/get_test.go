@@ -192,9 +192,21 @@ func runCommonTests(t *testing.T, obj any) {
 			errFmt: "connection.missing: field \"missing\" not found in structaccess.inner",
 		},
 		{
-			name:   "wrong index target",
-			path:   "connection[0]",
-			errFmt: "connection[0]: cannot index struct",
+			// [0] on a struct is a no-op (Terraform list-block syntax for single blocks)
+			name: "index [0] on struct is no-op",
+			path: "connection[0]",
+			want: inner{ID: "abc", Name: "x"},
+		},
+		{
+			name: "index [0] on struct then field",
+			path: "connection[0].id",
+			want: "abc",
+		},
+		{
+			// Non-zero index on a struct is still an error.
+			name:   "non-zero index on struct is error",
+			path:   "connection[1]",
+			errFmt: "connection[1]: cannot index struct",
 		},
 		{
 			name:     "out of range index",
@@ -402,7 +414,7 @@ func TestGet_Embedded_ValueAnonymousResolved(t *testing.T) {
 	type host struct {
 		embedded
 	}
-	in := host{embedded: embedded{Hidden: "x"}}
+	in := host{Hidden: "x"}
 	require.NoError(t, ValidateByString(reflect.TypeFor[host](), "hidden"))
 	testGet(t, in, "hidden", "x")
 }
@@ -441,7 +453,7 @@ func TestGet_BundleTag_SkipsPromoted(t *testing.T) {
 		embedded
 	}
 	// Promoted readonly field should be invisible
-	_, err := GetByString(host{embedded: embedded{Hidden: "x"}}, "hidden")
+	_, err := GetByString(host{Hidden: "x"}, "hidden")
 	require.EqualError(t, err, "hidden: field \"hidden\" not found in structaccess.host")
 	require.EqualError(t, ValidateByString(reflect.TypeFor[host](), "hidden"), "hidden: field \"hidden\" not found in structaccess.host")
 }
@@ -462,13 +474,11 @@ func TestGet_EmbeddedStructForceSendFields(t *testing.T) {
 	objWithOuterFSF := Outer{
 		OuterFieldOmit:   "",
 		OuterFieldNoOmit: "",
-		Inner: Inner{
-			InnerFieldOmit:   "",
-			InnerFieldNoOmit: "",
-			// Presence of "OuterFieldOmit" does not have any effect
-			// on OuterFieldOmit because it's in the wrong struct
-			ForceSendFields: []string{"OuterFieldOmit"},
-		},
+		InnerFieldOmit:   "",
+		InnerFieldNoOmit: "",
+		// Presence of "OuterFieldOmit" does not have any effect
+		// on OuterFieldOmit because it's in the wrong struct
+		ForceSendFields: []string{"OuterFieldOmit"},
 	}
 
 	testGet(t, objWithOuterFSF, "outer_field_omit", nil)
@@ -479,11 +489,9 @@ func TestGet_EmbeddedStructForceSendFields(t *testing.T) {
 	objWithInnerFSF := Outer{
 		OuterFieldOmit:   "",
 		OuterFieldNoOmit: "",
-		Inner: Inner{
-			InnerFieldOmit:   "",
-			InnerFieldNoOmit: "",
-			ForceSendFields:  []string{"InnerFieldOmit"},
-		},
+		InnerFieldOmit:   "",
+		InnerFieldNoOmit: "",
+		ForceSendFields:  []string{"InnerFieldOmit"},
 	}
 
 	testGet(t, objWithInnerFSF, "outer_field_omit", nil)
@@ -520,10 +528,8 @@ func TestGet_MultipleEmbeddedStructsForceSendFields(t *testing.T) {
 			FirstFieldNoOmit: "",
 			ForceSendFields:  []string{"FirstFieldOmit"},
 		},
-		Second: Second{
-			SecondFieldOmit:   "",
-			SecondFieldNoOmit: "",
-		},
+		SecondFieldOmit:   "",
+		SecondFieldNoOmit: "",
 	}
 
 	testGet(t, objWithFirstFSF, "outer_field_omit", nil)
@@ -536,10 +542,8 @@ func TestGet_MultipleEmbeddedStructsForceSendFields(t *testing.T) {
 	objWithSecondFSF := Outer{
 		OuterFieldOmit:   "",
 		OuterFieldNoOmit: "",
-		First: First{
-			FirstFieldOmit:   "",
-			FirstFieldNoOmit: "",
-		},
+		FirstFieldOmit:   "",
+		FirstFieldNoOmit: "",
 		Second: Second{
 			SecondFieldOmit:   "",
 			SecondFieldNoOmit: "",
@@ -576,17 +580,13 @@ func TestGet_MixedForceSendFields(t *testing.T) {
 	}
 
 	objWithOuterFSF := Outer{
-		OuterFieldOmit:   "",
-		OuterFieldNoOmit: "",
-		ForceSendFields:  []string{"OuterFieldOmit"},
-		First: First{
-			FirstFieldOmit:   "",
-			FirstFieldNoOmit: "",
-		},
-		Second: Second{
-			SecondFieldOmit:   "",
-			SecondFieldNoOmit: "",
-		},
+		OuterFieldOmit:    "",
+		OuterFieldNoOmit:  "",
+		ForceSendFields:   []string{"OuterFieldOmit"},
+		FirstFieldOmit:    "",
+		FirstFieldNoOmit:  "",
+		SecondFieldOmit:   "",
+		SecondFieldNoOmit: "",
 	}
 
 	testGet(t, objWithOuterFSF, "outer_field_omit", "")
@@ -599,10 +599,8 @@ func TestGet_MixedForceSendFields(t *testing.T) {
 	objWithSecondFSF := Outer{
 		OuterFieldOmit:   "",
 		OuterFieldNoOmit: "",
-		First: First{
-			FirstFieldOmit:   "",
-			FirstFieldNoOmit: "",
-		},
+		FirstFieldOmit:   "",
+		FirstFieldNoOmit: "",
 		Second: Second{
 			SecondFieldOmit:   "",
 			SecondFieldNoOmit: "",
@@ -636,13 +634,9 @@ func TestGet_FieldByNameBugRegressionTest(t *testing.T) {
 	}
 
 	objWithNameValue := Job{
-		BaseResource: BaseResource{
-			ID: "resource_id",
-		},
-		JobSettings: JobSettings{
-			Name:            "test-job",
-			ForceSendFields: []string{"Name"},
-		},
+		ID:                "resource_id",
+		Name:              "test-job",
+		ForceSendFields:   []string{"Name"},
 		PermissionsOmit:   []string{"read", "write"},
 		PermissionsNoOmit: []string{"read", "write"},
 	}
@@ -653,13 +647,9 @@ func TestGet_FieldByNameBugRegressionTest(t *testing.T) {
 	testGet(t, objWithNameValue, "permissions_no_omit", []string{"read", "write"})
 
 	objWithEmptyFields := Job{
-		BaseResource: BaseResource{
-			ID: "",
-		},
-		JobSettings: JobSettings{
-			Name:            "",
-			ForceSendFields: []string{"Name"},
-		},
+		ID:                "",
+		Name:              "",
+		ForceSendFields:   []string{"Name"},
 		PermissionsOmit:   []string{},
 		PermissionsNoOmit: []string{},
 	}

@@ -18,12 +18,20 @@ import (
 	"github.com/databricks/cli/libs/dyn/merge"
 	"github.com/databricks/cli/libs/dyn/yamlloader"
 	"github.com/databricks/cli/libs/log"
+	"github.com/databricks/cli/libs/structs/structpath"
 	"github.com/databricks/databricks-sdk-go/service/jobs"
 )
 
 type Script struct {
 	// Content of the script to be executed.
 	Content string `json:"content"`
+
+	// Env is a map of environment variables exported when running the script.
+	// Values may reference ${bundle.*}, ${workspace.*}, ${var.*} (or
+	// ${variables.*}); other prefixes are rejected at validation time.
+	// Use this to pass bundle configuration into a script's shell environment
+	// without polluting the script content with DABs interpolation syntax.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 type Root struct { //nolint:recvcheck // value receivers for read-only accessors, pointer for mutators
@@ -107,12 +115,11 @@ func LoadFromBytes(path string, raw []byte) (*Root, diag.Diagnostics) {
 	// Load configuration tree from YAML.
 	v, err := yamlloader.LoadYAML(path, bytes.NewBuffer(raw))
 	if err != nil {
-		var le *yamlloader.LocationError
-		if errors.As(err, &le) {
+		if le, ok := errors.AsType[*yamlloader.LocationError](err); ok {
 			return nil, diag.Diagnostics{{
 				Severity:  diag.Error,
 				Summary:   le.Summary,
-				Locations: []dyn.Location{le.Loc},
+				Locations: []diag.Location{le.Loc},
 			}}
 		}
 		return nil, diag.Errorf("failed to load %s: %v", path, err)
@@ -282,7 +289,7 @@ func (r *Root) InitializeVariables(vars []string) error {
 
 		err := r.Variables[name].Set(val)
 		if err != nil {
-			return fmt.Errorf("failed to assign %s to %s: %s", val, name, err)
+			return fmt.Errorf("failed to assign %s to %s: %w", val, name, err)
 		}
 	}
 	return nil
@@ -580,10 +587,10 @@ func validateVariableOverrides(root, target dyn.Value) (err error) {
 // Best effort to get the location of configuration value at the specified path.
 // This function is useful to annotate error messages with the location, because
 // we don't want to fail with a different error message if we cannot retrieve the location.
-func (r Root) GetLocation(path string) dyn.Location {
+func (r Root) GetLocation(path string) diag.Location {
 	v, err := dyn.Get(r.value, path)
 	if err != nil {
-		return dyn.Location{}
+		return diag.Location{}
 	}
 	return v.Location()
 }
@@ -591,12 +598,39 @@ func (r Root) GetLocation(path string) dyn.Location {
 // Get all locations of the configuration value at the specified path. We need both
 // this function and it's singular version (GetLocation) because some diagnostics just need
 // the primary location and some need all locations associated with a configuration value.
-func (r Root) GetLocations(path string) []dyn.Location {
+func (r Root) GetLocations(path string) []diag.Location {
 	v, err := dyn.Get(r.value, path)
 	if err != nil {
 		return nil
 	}
 	return v.Locations()
+}
+
+// GetLocationOf is [Root.GetLocation] for a path node.
+func (r Root) GetLocationOf(path *structpath.PathNode) diag.Location {
+	v, ok := r.valueOf(path)
+	if !ok {
+		return diag.Location{}
+	}
+	return v.Location()
+}
+
+// GetLocationsOf is [Root.GetLocations] for a path node.
+func (r Root) GetLocationsOf(path *structpath.PathNode) []diag.Location {
+	v, ok := r.valueOf(path)
+	if !ok {
+		return nil
+	}
+	return v.Locations()
+}
+
+func (r Root) valueOf(path *structpath.PathNode) (dyn.Value, bool) {
+	p, ok := dyn.FromStructPath(path)
+	if !ok {
+		return dyn.InvalidValue, false
+	}
+	v, err := dyn.GetByPath(r.value, p)
+	return v, err == nil
 }
 
 // GetNodeAndType and returns parent resource node and type of the resource in direct backend.

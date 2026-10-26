@@ -8,6 +8,31 @@ import (
 	"strings"
 )
 
+// filteredEnvMatrix returns a copy of matrix with values removed by single-condition
+// exclude rules applied directly. Multi-condition rules (pruning specific combinations)
+// are left for runtime and do not affect the per-key value lists.
+// Keys with an empty value list are preserved as-is: an empty list signals
+// an intentional override that clears an inherited matrix variable.
+func filteredEnvMatrix(matrix, exclude map[string][]string) map[string][]string {
+	if len(exclude) == 0 {
+		return matrix
+	}
+	result := maps.Clone(matrix)
+	for _, conditions := range exclude {
+		if len(conditions) != 1 {
+			continue
+		}
+		k, v, ok := strings.Cut(conditions[0], "=")
+		if !ok {
+			continue
+		}
+		if vals, exists := result[k]; exists && len(vals) > 0 {
+			result[k] = slices.DeleteFunc(slices.Clone(vals), func(x string) bool { return x == v })
+		}
+	}
+	return result
+}
+
 const MaterializedConfigFile = "out.test.toml"
 
 // GenerateMaterializedConfig creates a TOML representation of the configuration fields
@@ -15,12 +40,8 @@ const MaterializedConfigFile = "out.test.toml"
 func GenerateMaterializedConfig(config *TestConfig) string {
 	var buf strings.Builder
 
-	writeBool(&buf, "Local", config.Local)
 	writeBool(&buf, "Cloud", config.Cloud)
 	writeBool(&buf, "CloudSlow", config.CloudSlow)
-	writeBool(&buf, "RequiresUnityCatalog", config.RequiresUnityCatalog)
-	writeBool(&buf, "RequiresCluster", config.RequiresCluster)
-	writeBool(&buf, "RequiresWarehouse", config.RequiresWarehouse)
 	writeBool(&buf, "RunsOnDbr", config.RunsOnDbr)
 	if config.Phase != 0 {
 		fmt.Fprintf(&buf, "Phase = %d\n", config.Phase)
@@ -32,8 +53,9 @@ func GenerateMaterializedConfig(config *TestConfig) string {
 	for _, k := range slices.Sorted(maps.Keys(config.CloudEnvs)) {
 		fmt.Fprintf(&buf, "CloudEnvs.%s = %v\n", k, config.CloudEnvs[k])
 	}
-	for _, k := range slices.Sorted(maps.Keys(config.EnvMatrix)) {
-		writeTomlStringArray(&buf, "EnvMatrix."+k, config.EnvMatrix[k])
+	envMatrix := filteredEnvMatrix(config.EnvMatrix, config.EnvMatrixExclude)
+	for _, k := range slices.Sorted(maps.Keys(envMatrix)) {
+		writeTomlStringArray(&buf, "EnvMatrix."+k, envMatrix[k])
 	}
 
 	return buf.String()

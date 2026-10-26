@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/databricks/cli/libs/databrickscfg"
 	"github.com/databricks/databricks-sdk-go/config"
@@ -39,13 +41,42 @@ func TestProfiles(t *testing.T) {
 
 	// Load the profile
 	profile := &profileMetadata{Name: "profile1"}
-	profile.Load(ctx, configFile, true)
+	profile.Load(ctx, configFile, true, profileValidationTimeout)
 
 	// Check the profile
 	assert.Equal(t, "profile1", profile.Name)
 	assert.Equal(t, "https://abc.cloud.databricks.com", profile.Host)
 	assert.Equal(t, "aws", profile.Cloud)
 	assert.Equal(t, "pat", profile.AuthType)
+}
+
+// TestProfileLoadSkipValidateMakesNoRequests guards the --skip-validate
+// contract: EnsureResolved would otherwise fetch /.well-known/databricks-config
+// for every profile, so the handler counts every request it receives.
+func TestProfileLoadSkipValidateMakesNoRequests(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, ".databrickscfg")
+	t.Setenv("HOME", dir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", dir)
+	}
+
+	content := "[offline-profile]\nhost = " + server.URL + "\ntoken = test-token\n"
+	require.NoError(t, os.WriteFile(configFile, []byte(content), 0o600))
+
+	p := &profileMetadata{Name: "offline-profile", Host: server.URL}
+	p.Load(t.Context(), configFile, true, profileValidationTimeout)
+
+	assert.Zero(t, requests.Load(), "expected no network calls with skipValidate")
+	assert.Equal(t, server.URL, p.Host)
+	assert.False(t, p.Valid)
 }
 
 func TestProfilesDefaultMarker(t *testing.T) {
@@ -192,7 +223,7 @@ func TestProfileLoadSPOGConfigType(t *testing.T) {
 				Host:      tc.host,
 				AccountID: tc.accountID,
 			}
-			p.Load(t.Context(), configFile, false)
+			p.Load(t.Context(), configFile, false, profileValidationTimeout)
 
 			assert.Equal(t, tc.wantValid, p.Valid, "Valid mismatch")
 			assert.NotEmpty(t, p.Host, "Host should be set")
@@ -248,9 +279,51 @@ func TestProfileLoadNoDiscoveryStaysWorkspace(t *testing.T) {
 		Host:      server.URL,
 		AccountID: "some-acct",
 	}
-	p.Load(t.Context(), configFile, false)
+	p.Load(t.Context(), configFile, false, profileValidationTimeout)
 
 	assert.True(t, p.Valid, "should validate as workspace when discovery is unavailable")
 	assert.NotEmpty(t, p.Host)
 	assert.Equal(t, "pat", p.AuthType)
+}
+
+// TestProfileLoadTimesOutOnUnresponsiveHost is a regression test for a hang:
+// the SDK retries transient network failures for ~5 minutes by default, so a
+// host that accepts the connection but never responds would stall the whole
+// `auth profiles` listing. The timeout passed to Load must bound the wait
+// (including the EnsureResolved metadata fetch, which runs on context.Background
+// and so is only reachable via HTTPTimeoutSeconds/RetryTimeoutSeconds).
+//
+// A 2s timeout is passed here — kept >=1s because Load derives the SDK's
+// integer-second budgets from it, and a sub-second value would floor to 0
+// (which the SDK reads as "use the default", defeating the test).
+func TestProfileLoadTimesOutOnUnresponsiveHost(t *testing.T) {
+	// A server that hangs every request until the client gives up. Waiting on
+	// the request context (rather than a private channel) means the handler
+	// returns as soon as our timeout cancels the call, so server.Close doesn't
+	// block on a leaked connection during cleanup.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, ".databrickscfg")
+	t.Setenv("HOME", dir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", dir)
+	}
+	content := "[hung]\nhost = " + server.URL + "\ntoken = test-token\n"
+	require.NoError(t, os.WriteFile(configFile, []byte(content), 0o600))
+
+	p := &profileMetadata{Name: "hung", Host: server.URL}
+	start := time.Now()
+	p.Load(t.Context(), configFile, false, 2*time.Second)
+	elapsed := time.Since(start)
+
+	assert.False(t, p.Valid, "an unresponsive host must not validate")
+	// Generously above the 2s bound (metadata fetch + validation call, each
+	// bounded) but far below the SDK's ~5m default that this timeout prevents.
+	// A regression that drops the bound would blow past this and the whole
+	// package would then hit the go test -timeout instead.
+	assert.Less(t, elapsed, 60*time.Second, "Load must be bounded by profileValidationTimeout, not the SDK default")
 }

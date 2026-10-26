@@ -1,20 +1,14 @@
 sethome "./home"
 
-# Create a config with two profiles and an explicit default.
-cat > "./home/.databrickscfg" <<EOF
-[DEFAULT]
+# A config with two profiles and an explicit default.
+envsubst < "./home/.databrickscfg.tmpl" > "./home/.databrickscfg"
 
-[my-workspace]
-host  = $DATABRICKS_HOST
-token = $DATABRICKS_TOKEN
+# DATABRICKS_HOST is set in the environment, so authentication is fully
+# determined by the environment and the default profile is not pinned.
+title "Describe without --profile (DATABRICKS_HOST takes precedence over default_profile)\n"
+trace $CLI auth describe
 
-[other-workspace]
-host  = https://other.cloud.databricks.com
-token = other-token
-
-[__settings__]
-default_profile = my-workspace
-EOF
-
-title "Describe without --profile (should use default)\n"
+# Without a host in the environment, the default profile is resolved and used.
+unset DATABRICKS_HOST DATABRICKS_TOKEN
+title "Describe without --profile and without DATABRICKS_HOST (uses default_profile)\n"
 trace $CLI auth describe

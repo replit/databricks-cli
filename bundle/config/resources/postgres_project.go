@@ -16,21 +16,42 @@ type PostgresProjectConfig struct {
 	// ProjectId is the user-specified ID for the project (becomes part of the hierarchical name).
 	// This is specified during creation and becomes part of Name: "projects/{project_id}"
 	ProjectId string `json:"project_id"`
+
+	// PurgeOnDelete, when true, hard-deletes the project on destroy (Purge=true on
+	// DeleteProject). When false or unset, the backend performs a soft delete that
+	// can be undone within the project's retention window. Input-only: not
+	// returned by the GET API.
+	PurgeOnDelete bool `json:"purge_on_delete,omitempty"`
+
+	// ForceSendFields shadows the embedded ProjectSpec.ForceSendFields so the
+	// SDK's marshal package tracks zero-value top-level fields (project_id,
+	// purge_on_delete) here instead of polluting ProjectSpec.ForceSendFields
+	// with names that don't exist in that struct.
+	ForceSendFields []string `json:"-" url:"-"`
 }
 
 func (c *PostgresProjectConfig) UnmarshalJSON(b []byte) error {
 	return marshal.Unmarshal(b, c)
 }
 
-func (c *PostgresProjectConfig) MarshalJSON() ([]byte, error) {
+func (c PostgresProjectConfig) MarshalJSON() ([]byte, error) {
 	return marshal.Marshal(c)
 }
 
 type PostgresProject struct {
 	BaseResource
+	ID string `json:"id,omitempty" bundle:"readonly"`
 	PostgresProjectConfig
 
 	Permissions []Permission `json:"permissions,omitempty"`
+}
+
+func (p *PostgresProject) UnmarshalJSON(b []byte) error {
+	return marshal.Unmarshal(b, p)
+}
+
+func (p PostgresProject) MarshalJSON() ([]byte, error) {
+	return marshal.Marshal(p)
 }
 
 func (p *PostgresProject) Exists(ctx context.Context, w *databricks.WorkspaceClient, name string) (bool, error) {
@@ -55,9 +76,9 @@ func (p *PostgresProject) GetName() string {
 	return p.DisplayName
 }
 
-func (p *PostgresProject) GetURL() string {
+func (p *PostgresProject) GetURL() (string, bool) {
 	// The IDs in the API do not (yet) map to IDs in the web UI.
-	return ""
+	return "", false
 }
 
 func (p *PostgresProject) InitializeURL(_ url.URL) {

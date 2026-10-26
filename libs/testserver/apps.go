@@ -11,12 +11,50 @@ import (
 	"github.com/databricks/databricks-sdk-go/service/iam"
 )
 
+const (
+	appStatusRunningMessage     = "App has status: App is running"
+	appStatusUnavailableMessage = "App status is unavailable."
+)
+
+// setUcSecurableKinds mimics the platform computing an output-only
+// securable_kind (e.g. TABLE_DELTA) for UC TABLE securables. The client never
+// sends it, but the backend returns it on every read; VOLUME and other
+// securable types get none. See https://github.com/databricks/cli/issues/6342
+func setUcSecurableKinds(app *apps.App) {
+	for _, res := range app.Resources {
+		if res.UcSecurable != nil && res.UcSecurable.SecurableType == apps.AppResourceUcSecurableUcSecurableTypeTable {
+			res.UcSecurable.SecurableKind = "TABLE_DELTA"
+		}
+	}
+}
+
 func (s *FakeWorkspace) AppsCreateUpdate(req Request, name string) Response {
 	var updateReq apps.AsyncUpdateAppRequest
 	if err := json.Unmarshal(req.Body, &updateReq); err != nil {
 		return Response{
 			Body:       fmt.Sprintf("internal error: %s", err),
 			StatusCode: http.StatusInternalServerError,
+		}
+	}
+
+	// The real API rejects source_code_path in the UpdateApp body at any value.
+	if updateReq.App != nil {
+		var rawBody struct {
+			App json.RawMessage `json:"app"`
+		}
+		if err := json.Unmarshal(req.Body, &rawBody); err == nil {
+			var appFields map[string]json.RawMessage
+			if err := json.Unmarshal(rawBody.App, &appFields); err == nil {
+				if _, ok := appFields["source_code_path"]; ok {
+					return Response{
+						StatusCode: http.StatusBadRequest,
+						Body: map[string]string{
+							"error_code": "INVALID_PARAMETER_VALUE",
+							"message":    "deployment_source.source_code_path cannot be set on UpdateApp.",
+						},
+					}
+				}
+			}
 		}
 	}
 
@@ -61,6 +99,7 @@ func (s *FakeWorkspace) AppsCreateUpdate(req Request, name string) Response {
 			return Response{Body: fmt.Sprintf("internal error: %s", err), StatusCode: http.StatusInternalServerError}
 		}
 	}
+	setUcSecurableKinds(&existing)
 	s.Apps[name] = existing
 
 	return Response{
@@ -118,18 +157,28 @@ func (s *FakeWorkspace) AppsCreateDeployment(req Request, name string) Response 
 func (s *FakeWorkspace) AppsGetDeployment(_ Request, name, deploymentID string) Response {
 	defer s.LockUnlock()()
 
-	_, ok := s.Apps[name]
+	app, ok := s.Apps[name]
 	if !ok {
 		return Response{StatusCode: 404}
 	}
 
-	return Response{Body: apps.AppDeployment{
-		DeploymentId: deploymentID,
-		Status: &apps.AppDeploymentStatus{
-			State:   apps.AppDeploymentStateSucceeded,
-			Message: "Deployment succeeded",
-		},
-	}}
+	if app.ActiveDeployment == nil || app.ActiveDeployment.DeploymentId != deploymentID {
+		return Response{StatusCode: 404}
+	}
+
+	// Return a copy so the masking below does not mutate the stored deployment.
+	deployment := *app.ActiveDeployment
+
+	// The real GET response strips env var values, returning only the name of
+	// each variable. Reproduce that masking so the local golden matches
+	// recorded cloud behavior.
+	maskedEnvVars := make([]apps.EnvVar, len(deployment.EnvVars))
+	for i, ev := range deployment.EnvVars {
+		maskedEnvVars[i] = apps.EnvVar{Name: ev.Name}
+	}
+	deployment.EnvVars = maskedEnvVars
+
+	return Response{Body: deployment}
 }
 
 func (s *FakeWorkspace) AppsStart(_ Request, name string) Response {
@@ -143,6 +192,11 @@ func (s *FakeWorkspace) AppsStart(_ Request, name string) Response {
 	app.ComputeStatus = &apps.ComputeStatus{
 		State:   apps.ComputeStateActive,
 		Message: "App compute is active.",
+	}
+	// Starting the compute brings the application up.
+	app.AppStatus = &apps.ApplicationStatus{
+		State:   "RUNNING",
+		Message: appStatusRunningMessage,
 	}
 	s.Apps[name] = app
 
@@ -159,11 +213,72 @@ func (s *FakeWorkspace) AppsStop(_ Request, name string) Response {
 
 	app.ComputeStatus = &apps.ComputeStatus{
 		State:   apps.ComputeStateStopped,
-		Message: "App compute is stopped.",
+		Message: "Start the app compute to deploy the app.",
 	}
+	// Stopping the compute takes the application down.
+	app.AppStatus = &apps.ApplicationStatus{
+		State:   "UNAVAILABLE",
+		Message: appStatusUnavailableMessage,
+	}
+	// The backend clears both deployments on stop for the apps these fixtures use,
+	// so the deploy-only fields read back empty. Match that so drift tests are realistic.
+	app.ActiveDeployment = nil
+	app.PendingDeployment = nil
 	s.Apps[name] = app
 
 	return Response{Body: app}
+}
+
+// AppsGet returns the app, keeping DELETING resources visible so callers can
+// observe transient state (matches the cloud DELETE lifecycle).
+func (s *FakeWorkspace) AppsGet(name string) Response {
+	defer s.LockUnlock()()
+
+	app, ok := s.Apps[name]
+	if !ok {
+		return Response{
+			StatusCode: 404,
+			Body:       map[string]string{"message": fmt.Sprintf("Resource apps.App not found: %v", name)},
+		}
+	}
+
+	return Response{Body: app}
+}
+
+// AppsDelete simulates the real Apps DELETE lifecycle: the first DELETE flips
+// the app into DELETING state (without removing it), and a second DELETE while
+// still in DELETING returns 400 with the exact cloud error message.
+func (s *FakeWorkspace) AppsDelete(name string) Response {
+	defer s.LockUnlock()()
+
+	app, ok := s.Apps[name]
+	if !ok {
+		return Response{StatusCode: 404}
+	}
+
+	if app.ComputeStatus != nil && app.ComputeStatus.State == apps.ComputeStateDeleting {
+		return Response{
+			StatusCode: http.StatusBadRequest,
+			Body: map[string]string{
+				"error_code": "BAD_REQUEST",
+				"message": fmt.Sprintf(
+					"Cannot delete app %s as it is not terminal with state DELETING, "+
+						"and was updated less than 20 minutes ago. Please wait before trying again.", name),
+			},
+		}
+	}
+
+	app.ComputeStatus = &apps.ComputeStatus{
+		State:   apps.ComputeStateDeleting,
+		Message: "App is being deleted.",
+	}
+	app.AppStatus = &apps.ApplicationStatus{
+		State:   "UNAVAILABLE",
+		Message: appStatusUnavailableMessage,
+	}
+	s.Apps[name] = app
+
+	return Response{}
 }
 
 func (s *FakeWorkspace) AppsUpsert(req Request, name string) Response {
@@ -205,18 +320,22 @@ func (s *FakeWorkspace) AppsUpsert(req Request, name string) Response {
 		}
 	}
 
-	app.AppStatus = &apps.ApplicationStatus{
-		State:   "RUNNING",
-		Message: "Application is running.",
-	}
-
-	// Respect no_compute query param: if true, start the app in STOPPED state.
+	// A no_compute app is created without running compute, so on cloud it
+	// reports an UNAVAILABLE application status until it is started.
 	if req.URL.Query().Get("no_compute") == "true" {
+		app.AppStatus = &apps.ApplicationStatus{
+			State:   "UNAVAILABLE",
+			Message: appStatusUnavailableMessage,
+		}
 		app.ComputeStatus = &apps.ComputeStatus{
 			State:   apps.ComputeStateStopped,
 			Message: "App compute is stopped.",
 		}
 	} else {
+		app.AppStatus = &apps.ApplicationStatus{
+			State:   "RUNNING",
+			Message: "Application is running.",
+		}
 		app.ComputeStatus = &apps.ComputeStatus{
 			State:   "ACTIVE",
 			Message: "App compute is active.",
@@ -244,6 +363,10 @@ func (s *FakeWorkspace) AppsUpsert(req Request, name string) Response {
 		app.ComputeSize = "MEDIUM"
 	}
 
+	// The platform enables user access token forwarding regardless of what the
+	// request asked for, so the remote always reports true.
+	app.ForwardUserAccessToken = true
+
 	// Assign a service principal to the app, mimicking the real platform.
 	if app.ServicePrincipalClientId == "" {
 		app.ServicePrincipalClientId = nextUUID()
@@ -266,6 +389,8 @@ func (s *FakeWorkspace) AppsUpsert(req Request, name string) Response {
 			}},
 		})
 	}
+
+	setUcSecurableKinds(&app)
 
 	s.Apps[name] = app
 	return Response{

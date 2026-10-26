@@ -24,6 +24,10 @@ func New() *cobra.Command {
 		RunE:    root.ReportUnknownSubcommand,
 	}
 
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
 	// Add methods
 	cmd.AddCommand(newDownload())
 
@@ -56,9 +60,7 @@ func newDownload() *cobra.Command {
 	cmd.Long = `Return billable usage logs.
 
   Returns billable usage logs in CSV format for the specified account and date
-  range. For the data schema, see:
-
-  - AWS: [CSV file schema]. - GCP: [CSV file schema].
+  range.
 
   Note that this method might take multiple minutes to complete.
 
@@ -66,8 +68,6 @@ func newDownload() *cobra.Command {
   the account, the size of the response and the internet speed of the caller,
   this API may hit a timeout after a few minutes. If you experience this, try to
   mitigate by calling the API with narrower date ranges.
-
-  [CSV file schema]: https://docs.gcp.databricks.com/administration-guide/account-settings/usage-analysis.html#csv-file-schema
 
   Arguments:
     START_MONTH: Format specification for month in the format YYYY-MM. This is used to
@@ -77,6 +77,8 @@ func newDownload() *cobra.Command {
       field is required.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)

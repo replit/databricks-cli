@@ -3,6 +3,7 @@
 package policies
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/databricks/cli/cmd/root"
@@ -32,6 +33,10 @@ func New() *cobra.Command {
 		GroupID: "catalog",
 		RunE:    root.ReportUnknownSubcommand,
 	}
+
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	// Add methods
 	cmd.AddCommand(newCreatePolicy())
@@ -68,11 +73,15 @@ func newCreatePolicy() *cobra.Command {
 
 	// TODO: complex arg: column_mask
 	cmd.Flags().StringVar(&createPolicyReq.PolicyInfo.Comment, "comment", createPolicyReq.PolicyInfo.Comment, `Optional description of the policy.`)
+	// TODO: complex arg: deny
 	// TODO: array: except_principals
+	// TODO: array: governed_tags
+	// TODO: complex arg: grant
 	// TODO: array: match_columns
 	cmd.Flags().StringVar(&createPolicyReq.PolicyInfo.Name, "name", createPolicyReq.PolicyInfo.Name, `Name of the policy.`)
 	cmd.Flags().StringVar(&createPolicyReq.PolicyInfo.OnSecurableFullname, "on-securable-fullname", createPolicyReq.PolicyInfo.OnSecurableFullname, `Full name of the securable on which the policy is defined.`)
 	cmd.Flags().Var(&createPolicyReq.PolicyInfo.OnSecurableType, "on-securable-type", `Type of the securable on which the policy is defined. Supported values: [
+  AGENT_SERVICE,
   CATALOG,
   CLEAN_ROOM,
   CONNECTION,
@@ -80,12 +89,17 @@ func newCreatePolicy() *cobra.Command {
   EXTERNAL_LOCATION,
   EXTERNAL_METADATA,
   FUNCTION,
+  MCP_SERVICE,
   METASTORE,
+  MODEL,
+  MODEL_PROVIDER_SERVICE,
+  MODEL_SERVICE,
   PIPELINE,
   PROVIDER,
   RECIPIENT,
   SCHEMA,
   SHARE,
+  SKILL,
   STAGING_TABLE,
   STORAGE_CREDENTIAL,
   TABLE,
@@ -104,9 +118,10 @@ func newCreatePolicy() *cobra.Command {
   Arguments:
     TO_PRINCIPALS: List of user or group names that the policy applies to. Required on create
       and optional on update.
-    FOR_SECURABLE_TYPE: Type of securables that the policy should take effect on. Only TABLE is
-      supported at this moment. Required on create and optional on update.
+    FOR_SECURABLE_TYPE: Type of securables that the policy should take effect on. Required on
+      create and optional on update.
       Supported values: [
+        AGENT_SERVICE,
         CATALOG,
         CLEAN_ROOM,
         CONNECTION,
@@ -114,27 +129,34 @@ func newCreatePolicy() *cobra.Command {
         EXTERNAL_LOCATION,
         EXTERNAL_METADATA,
         FUNCTION,
+        MCP_SERVICE,
         METASTORE,
+        MODEL,
+        MODEL_PROVIDER_SERVICE,
+        MODEL_SERVICE,
         PIPELINE,
         PROVIDER,
         RECIPIENT,
         SCHEMA,
         SHARE,
+        SKILL,
         STAGING_TABLE,
         STORAGE_CREDENTIAL,
         TABLE,
         VOLUME,
       ]
     POLICY_TYPE: Type of the policy. Required on create.
-      Supported values: [POLICY_TYPE_COLUMN_MASK, POLICY_TYPE_ROW_FILTER]`
+      Supported values: [POLICY_TYPE_COLUMN_MASK, POLICY_TYPE_DENY, POLICY_TYPE_GRANT, POLICY_TYPE_ROW_FILTER]`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(0)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, no positional arguments are allowed. Provide 'to_principals', 'for_securable_type', 'policy_type' in your JSON input")
+				return errors.New("when --json flag is specified, no positional arguments are allowed. Provide 'to_principals', 'for_securable_type', 'policy_type' in your JSON input")
 			}
 			return nil
 		}
@@ -228,6 +250,8 @@ func newDeletePolicy() *cobra.Command {
     NAME: Required. The name of the policy to delete`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -289,6 +313,8 @@ func newGetPolicy() *cobra.Command {
     NAME: Required. The name of the policy to retrieve.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -369,6 +395,8 @@ func newListPolicies() *cobra.Command {
     ON_SECURABLE_FULLNAME: Required. The fully qualified name of securable to list policies for.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -427,11 +455,15 @@ func newUpdatePolicy() *cobra.Command {
 	cmd.Flags().StringVar(&updatePolicyReq.UpdateMask, "update-mask", updatePolicyReq.UpdateMask, `Optional.`)
 	// TODO: complex arg: column_mask
 	cmd.Flags().StringVar(&updatePolicyReq.PolicyInfo.Comment, "comment", updatePolicyReq.PolicyInfo.Comment, `Optional description of the policy.`)
+	// TODO: complex arg: deny
 	// TODO: array: except_principals
+	// TODO: array: governed_tags
+	// TODO: complex arg: grant
 	// TODO: array: match_columns
 	cmd.Flags().StringVar(&updatePolicyReq.PolicyInfo.Name, "name", updatePolicyReq.PolicyInfo.Name, `Name of the policy.`)
 	cmd.Flags().StringVar(&updatePolicyReq.PolicyInfo.OnSecurableFullname, "on-securable-fullname", updatePolicyReq.PolicyInfo.OnSecurableFullname, `Full name of the securable on which the policy is defined.`)
 	cmd.Flags().Var(&updatePolicyReq.PolicyInfo.OnSecurableType, "on-securable-type", `Type of the securable on which the policy is defined. Supported values: [
+  AGENT_SERVICE,
   CATALOG,
   CLEAN_ROOM,
   CONNECTION,
@@ -439,12 +471,17 @@ func newUpdatePolicy() *cobra.Command {
   EXTERNAL_LOCATION,
   EXTERNAL_METADATA,
   FUNCTION,
+  MCP_SERVICE,
   METASTORE,
+  MODEL,
+  MODEL_PROVIDER_SERVICE,
+  MODEL_SERVICE,
   PIPELINE,
   PROVIDER,
   RECIPIENT,
   SCHEMA,
   SHARE,
+  SKILL,
   STAGING_TABLE,
   STORAGE_CREDENTIAL,
   TABLE,
@@ -466,9 +503,10 @@ func newUpdatePolicy() *cobra.Command {
     NAME: Required. The name of the policy to update.
     TO_PRINCIPALS: List of user or group names that the policy applies to. Required on create
       and optional on update.
-    FOR_SECURABLE_TYPE: Type of securables that the policy should take effect on. Only TABLE is
-      supported at this moment. Required on create and optional on update.
+    FOR_SECURABLE_TYPE: Type of securables that the policy should take effect on. Required on
+      create and optional on update.
       Supported values: [
+        AGENT_SERVICE,
         CATALOG,
         CLEAN_ROOM,
         CONNECTION,
@@ -476,27 +514,34 @@ func newUpdatePolicy() *cobra.Command {
         EXTERNAL_LOCATION,
         EXTERNAL_METADATA,
         FUNCTION,
+        MCP_SERVICE,
         METASTORE,
+        MODEL,
+        MODEL_PROVIDER_SERVICE,
+        MODEL_SERVICE,
         PIPELINE,
         PROVIDER,
         RECIPIENT,
         SCHEMA,
         SHARE,
+        SKILL,
         STAGING_TABLE,
         STORAGE_CREDENTIAL,
         TABLE,
         VOLUME,
       ]
     POLICY_TYPE: Type of the policy. Required on create.
-      Supported values: [POLICY_TYPE_COLUMN_MASK, POLICY_TYPE_ROW_FILTER]`
+      Supported values: [POLICY_TYPE_COLUMN_MASK, POLICY_TYPE_DENY, POLICY_TYPE_GRANT, POLICY_TYPE_ROW_FILTER]`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(3)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only ON_SECURABLE_TYPE, ON_SECURABLE_FULLNAME, NAME as positional arguments. Provide 'to_principals', 'for_securable_type', 'policy_type' in your JSON input")
+				return errors.New("when --json flag is specified, provide only ON_SECURABLE_TYPE, ON_SECURABLE_FULLNAME, NAME as positional arguments. Provide 'to_principals', 'for_securable_type', 'policy_type' in your JSON input")
 			}
 			return nil
 		}

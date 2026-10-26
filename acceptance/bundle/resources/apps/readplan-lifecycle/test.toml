@@ -1,0 +1,8 @@
+Cloud = false
+Ignore = [".databricks", "tmp.plan.json"]
+
+EnvMatrix.READPLAN = ["", "1"]
+
+[[Repls]]
+Old = '(?m)^✓ [^\n]*\n'
+New = ""

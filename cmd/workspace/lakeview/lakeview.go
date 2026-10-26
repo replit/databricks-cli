@@ -3,6 +3,7 @@
 package lakeview
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/databricks/cli/cmd/root"
@@ -28,6 +29,10 @@ func New() *cobra.Command {
 		RunE:    root.ReportUnknownSubcommand,
 	}
 
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
 	// Add methods
 	cmd.AddCommand(newCreate())
 	cmd.AddCommand(newCreateSchedule())
@@ -43,6 +48,7 @@ func New() *cobra.Command {
 	cmd.AddCommand(newListSubscriptions())
 	cmd.AddCommand(newMigrate())
 	cmd.AddCommand(newPublish())
+	cmd.AddCommand(newRevert())
 	cmd.AddCommand(newTrash())
 	cmd.AddCommand(newUnpublish())
 	cmd.AddCommand(newUpdate())
@@ -84,9 +90,16 @@ func newCreate() *cobra.Command {
 	cmd.Short = `Create dashboard.`
 	cmd.Long = `Create dashboard.
 
-  Create a draft dashboard.`
+  Create a draft dashboard.
+
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(0)
@@ -157,18 +170,27 @@ func newCreateSchedule() *cobra.Command {
 	cmd.Short = `Create dashboard schedule.`
 	cmd.Long = `Create dashboard schedule.
 
+  Create dashboard schedule.
+
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard to which the schedule belongs.
     CRON_SCHEDULE: The cron expression describing the frequency of the periodic refresh for
       this schedule.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(1)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only DASHBOARD_ID as positional arguments. Provide 'cron_schedule' in your JSON input")
+				return errors.New("when --json flag is specified, provide only DASHBOARD_ID as positional arguments. Provide 'cron_schedule' in your JSON input")
 			}
 			return nil
 		}
@@ -246,6 +268,16 @@ func newCreateSubscription() *cobra.Command {
 	cmd.Short = `Create schedule subscription.`
 	cmd.Long = `Create schedule subscription.
 
+  Create schedule subscription.
+
+  The caller must be a workspace user with one of the following [entitlements]:
+  Workspace access, Databricks SQL access, or Consumer access.
+
+  Account-level users who are not members of the workspace cannot call this
+  endpoint, even if the dashboard has been shared with them.
+
+  [entitlements]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard to which the subscription belongs.
     SCHEDULE_ID: UUID identifying the schedule to which the subscription belongs.
@@ -253,12 +285,14 @@ func newCreateSubscription() *cobra.Command {
       to the schedule.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(2)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only DASHBOARD_ID, SCHEDULE_ID as positional arguments. Provide 'subscriber' in your JSON input")
+				return errors.New("when --json flag is specified, provide only DASHBOARD_ID, SCHEDULE_ID as positional arguments. Provide 'subscriber' in your JSON input")
 			}
 			return nil
 		}
@@ -333,11 +367,20 @@ func newDeleteSchedule() *cobra.Command {
 	cmd.Short = `Delete dashboard schedule.`
 	cmd.Long = `Delete dashboard schedule.
 
+  Delete dashboard schedule.
+
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard to which the schedule belongs.
     SCHEDULE_ID: UUID identifying the schedule.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -391,12 +434,24 @@ func newDeleteSubscription() *cobra.Command {
 	cmd.Short = `Delete schedule subscription.`
 	cmd.Long = `Delete schedule subscription.
 
+  Delete schedule subscription.
+
+  The caller must be a workspace user with one of the following [entitlements]:
+  Workspace access, Databricks SQL access, or Consumer access.
+
+  Account-level users who are not members of the workspace cannot call this
+  endpoint, even if the dashboard has been shared with them.
+
+  [entitlements]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard which the subscription belongs.
     SCHEDULE_ID: UUID identifying the schedule which the subscription belongs.
     SUBSCRIPTION_ID: UUID identifying the subscription.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -451,10 +506,17 @@ func newGet() *cobra.Command {
 
   Get a draft dashboard.
 
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -508,10 +570,18 @@ func newGetPublished() *cobra.Command {
 
   Get the current published dashboard.
 
+  The caller must be a workspace user with one of the following entitlements:
+  Workspace access, Databricks SQL access, or Consumer access.
+
+  Account-level users who are not members of the workspace cannot call this
+  endpoint, even if the dashboard has been shared with them.
+
   Arguments:
     DASHBOARD_ID: UUID identifying the published dashboard.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -563,11 +633,23 @@ func newGetSchedule() *cobra.Command {
 	cmd.Short = `Get dashboard schedule.`
 	cmd.Long = `Get dashboard schedule.
 
+  Get dashboard schedule.
+
+  The caller must be a workspace user with one of the following [entitlements]:
+  Workspace access, Databricks SQL access, or Consumer access.
+
+  Account-level users who are not members of the workspace cannot call this
+  endpoint, even if the dashboard has been shared with them.
+
+  [entitlements]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard to which the schedule belongs.
     SCHEDULE_ID: UUID identifying the schedule.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -620,12 +702,24 @@ func newGetSubscription() *cobra.Command {
 	cmd.Short = `Get schedule subscription.`
 	cmd.Long = `Get schedule subscription.
 
+  Get schedule subscription.
+
+  The caller must be a workspace user with one of the following [entitlements]:
+  Workspace access, Databricks SQL access, or Consumer access.
+
+  Account-level users who are not members of the workspace cannot call this
+  endpoint, even if the dashboard has been shared with them.
+
+  [entitlements]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard which the subscription belongs.
     SCHEDULE_ID: UUID identifying the schedule which the subscription belongs.
     SUBSCRIPTION_ID: UUID identifying the subscription.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(3)
@@ -681,7 +775,7 @@ func newList() *cobra.Command {
 
 	cmd.Flags().IntVar(&listReq.PageSize, "page-size", listReq.PageSize, `The number of dashboards to return per page.`)
 	cmd.Flags().BoolVar(&listReq.ShowTrashed, "show-trashed", listReq.ShowTrashed, `The flag to include dashboards located in the trash.`)
-	cmd.Flags().Var(&listReq.View, "view", `DASHBOARD_VIEW_BASIConly includes summary metadata from the dashboard. Supported values: [DASHBOARD_VIEW_BASIC]`)
+	cmd.Flags().Var(&listReq.View, "view", `DASHBOARD_VIEW_BASIC only includes summary metadata from the dashboard. Supported values: [DASHBOARD_VIEW_BASIC]`)
 
 	// Limit flag for total result capping.
 	cmd.Flags().IntVar(&listLimit, "limit", 0, `Maximum number of results to return.`)
@@ -692,9 +786,18 @@ func newList() *cobra.Command {
 
 	cmd.Use = "list"
 	cmd.Short = `List dashboards.`
-	cmd.Long = `List dashboards.`
+	cmd.Long = `List dashboards.
+
+  List dashboards.
+
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(0)
@@ -760,10 +863,22 @@ func newListSchedules() *cobra.Command {
 	cmd.Short = `List dashboard schedules.`
 	cmd.Long = `List dashboard schedules.
 
+  List dashboard schedules.
+
+  The caller must be a workspace user with one of the following [entitlements]:
+  Workspace access, Databricks SQL access, or Consumer access.
+
+  Account-level users who are not members of the workspace cannot call this
+  endpoint, even if the dashboard has been shared with them.
+
+  [entitlements]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard to which the schedules belongs.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -831,11 +946,23 @@ func newListSubscriptions() *cobra.Command {
 	cmd.Short = `List schedule subscriptions.`
 	cmd.Long = `List schedule subscriptions.
 
+  List schedule subscriptions.
+
+  The caller must be a workspace user with one of the following [entitlements]:
+  Workspace access, Databricks SQL access, or Consumer access.
+
+  Account-level users who are not members of the workspace cannot call this
+  endpoint, even if the dashboard has been shared with them.
+
+  [entitlements]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard which the subscriptions belongs.
     SCHEDULE_ID: UUID identifying the schedule which the subscriptions belongs.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(2)
@@ -898,18 +1025,21 @@ func newMigrate() *cobra.Command {
 	cmd.Short = `Migrate dashboard.`
 	cmd.Long = `Migrate dashboard.
 
-  Migrates a classic SQL dashboard to Lakeview.
+  Deprecated: Legacy dashboard migration is no longer supported. Use Lakeview
+  (AI/BI) dashboards instead.
 
   Arguments:
     SOURCE_DASHBOARD_ID: UUID of the dashboard to be migrated.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(0)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, no positional arguments are allowed. Provide 'source_dashboard_id' in your JSON input")
+				return errors.New("when --json flag is specified, no positional arguments are allowed. Provide 'source_dashboard_id' in your JSON input")
 			}
 			return nil
 		}
@@ -984,10 +1114,17 @@ func newPublish() *cobra.Command {
 
   Publish the current draft dashboard.
 
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard to be published.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1033,6 +1170,85 @@ func newPublish() *cobra.Command {
 	return cmd
 }
 
+// start revert command
+
+// Slice with functions to override default command behavior.
+// Functions can be added from the `init()` function in manually curated files in this directory.
+var revertOverrides []func(
+	*cobra.Command,
+	*dashboards.RevertDashboardRequest,
+)
+
+func newRevert() *cobra.Command {
+	cmd := &cobra.Command{}
+
+	var revertReq dashboards.RevertDashboardRequest
+	var revertJson flags.JsonFlag
+
+	cmd.Flags().Var(&revertJson, "json", `either inline JSON string or @path/to/file.json with request body`)
+
+	cmd.Use = "revert DASHBOARD_ID"
+	cmd.Short = `Revert dashboard.`
+	cmd.Long = `Revert dashboard.
+
+  Revert a dashboard's definition in draft mode to the last published version.
+
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
+  Arguments:
+    DASHBOARD_ID: UUID identifying the dashboard.`
+
+	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
+
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		check := root.ExactArgs(1)
+		return check(cmd, args)
+	}
+
+	cmd.PreRunE = root.MustWorkspaceClient
+	cmd.RunE = func(cmd *cobra.Command, args []string) (err error) {
+		ctx := cmd.Context()
+		w := cmdctx.WorkspaceClient(ctx)
+
+		if cmd.Flags().Changed("json") {
+			diags := revertJson.Unmarshal(&revertReq)
+			if diags.HasError() {
+				return diags.Error()
+			}
+			if len(diags) > 0 {
+				err := cmdio.RenderDiagnostics(ctx, diags)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		revertReq.DashboardId = args[0]
+
+		response, err := w.Lakeview.Revert(ctx, revertReq)
+		if err != nil {
+			return err
+		}
+
+		return cmdio.Render(ctx, response)
+	}
+
+	// Disable completions since they are not applicable.
+	// Can be overridden by manual implementation in `override.go`.
+	cmd.ValidArgsFunction = cobra.NoFileCompletions
+
+	// Apply optional overrides to this command.
+	for _, fn := range revertOverrides {
+		fn(cmd, &revertReq)
+	}
+
+	return cmd
+}
+
 // start trash command
 
 // Slice with functions to override default command behavior.
@@ -1053,10 +1269,17 @@ func newTrash() *cobra.Command {
 
   Trash a dashboard.
 
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1109,10 +1332,17 @@ func newUnpublish() *cobra.Command {
 
   Unpublish the dashboard.
 
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the published dashboard.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1175,10 +1405,17 @@ func newUpdate() *cobra.Command {
 
   Update a draft dashboard.
 
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		check := root.ExactArgs(1)
@@ -1250,6 +1487,13 @@ func newUpdateSchedule() *cobra.Command {
 	cmd.Short = `Update dashboard schedule.`
 	cmd.Long = `Update dashboard schedule.
 
+  Update dashboard schedule.
+
+  Requires the [Databricks SQL access] entitlement. Grant Databricks SQL access
+  in addition to Workspace access.
+
+  [Databricks SQL access]: https://docs.databricks.com/security/auth/entitlements
+
   Arguments:
     DASHBOARD_ID: UUID identifying the dashboard to which the schedule belongs.
     SCHEDULE_ID: UUID identifying the schedule.
@@ -1257,12 +1501,14 @@ func newUpdateSchedule() *cobra.Command {
       this schedule.`
 
 	cmd.Annotations = make(map[string]string)
+	cmd.Annotations["launch_stage"] = "GA"
+	cmd.Annotations["launch_stage_display"] = "GA"
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("json") {
 			err := root.ExactArgs(2)(cmd, args)
 			if err != nil {
-				return fmt.Errorf("when --json flag is specified, provide only DASHBOARD_ID, SCHEDULE_ID as positional arguments. Provide 'cron_schedule' in your JSON input")
+				return errors.New("when --json flag is specified, provide only DASHBOARD_ID, SCHEDULE_ID as positional arguments. Provide 'cron_schedule' in your JSON input")
 			}
 			return nil
 		}

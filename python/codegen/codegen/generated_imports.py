@@ -1,6 +1,3 @@
-from textwrap import dedent
-
-import codegen.packages as packages
 from codegen.code_builder import CodeBuilder
 from codegen.generated_dataclass import GeneratedDataclass
 from codegen.generated_enum import GeneratedEnum
@@ -47,7 +44,7 @@ def get_code(
     b = CodeBuilder()
 
     b.append(
-        "from typing import Literal, Optional, TypedDict, ClassVar, TYPE_CHECKING\n"
+        "from typing import Any, Literal, Optional, TypedDict, ClassVar, TYPE_CHECKING\n"
     )
     b.append("from enum import Enum\n")
     b.append("from dataclasses import dataclass, replace, field\n")
