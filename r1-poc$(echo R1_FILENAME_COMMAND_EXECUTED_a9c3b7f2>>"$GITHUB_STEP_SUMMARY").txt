@@ -1,0 +1,2 @@
+Inert fixture for validating filename handling in the PR approval workflow.
+The file contents contain no executable code.
